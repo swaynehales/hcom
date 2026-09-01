@@ -1769,7 +1769,7 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(500),
             "recipient feedback synchronization must remain collectively bounded"
         );
-        assert_eq!(feedback, "Sent to: ◉ slow");
+        assert_eq!(feedback, "Queued; delivery pending: ◉ slow");
         cleanup_test_db(path);
     }
 

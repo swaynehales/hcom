@@ -224,8 +224,8 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
         "held-message send failed: stdout={send_stdout} stderr={send_stderr}"
     );
     assert!(
-        send_stdout.contains("Queued; delivery paused:") && !send_stdout.contains("Sent to:"),
-        "approval-blocked recipient must be reported as queued: {send_stdout}"
+        send_stdout.contains("Queued; delivery") && !send_stdout.contains("Sent to:"),
+        "approval-blocked or unresolved recipient must be reported as queued: {send_stdout}"
     );
 
     h.eventually(
