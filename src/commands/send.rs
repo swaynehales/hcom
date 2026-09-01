@@ -1,5 +1,6 @@
 //! `hcom send` command — send messages to hcom instances.
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Read as IoRead};
 use std::time::{Duration, Instant};
 
@@ -239,9 +240,15 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
         }
         std::thread::sleep(RECIPIENT_FEEDBACK_POLL_INTERVAL.min(deadline - now));
     }
+    let unresolved: HashSet<&str> = sync_candidates
+        .iter()
+        .filter(|name| db.has_pending(name))
+        .map(String::as_str)
+        .collect();
 
     let mut healthy = Vec::new();
     let mut paused = Vec::new();
+    let mut pending = Vec::new();
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
@@ -249,6 +256,8 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
             let recipient = format!("{icon} {display}");
             if is_delivery_paused_status_context(&data.status_context) {
                 paused.push(recipient);
+            } else if unresolved.contains(name.as_str()) {
+                pending.push(recipient);
             } else {
                 healthy.push(recipient);
             }
@@ -265,6 +274,9 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     }
     if !paused.is_empty() {
         lines.push(format!("Queued; delivery paused: {}", paused.join(", ")));
+    }
+    if !pending.is_empty() {
+        lines.push(format!("Queued; delivery pending: {}", pending.join(", ")));
     }
     lines.join("\n")
 }
