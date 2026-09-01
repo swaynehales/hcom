@@ -76,6 +76,7 @@ const TUI_DELIVERY_PAUSED_STATUS_PREFIX: &str = "tui:";
 pub fn is_delivery_paused_status_context(status_context: &str) -> bool {
     status_context.starts_with(TUI_DELIVERY_PAUSED_STATUS_PREFIX)
         || status_context == "pty:approval"
+        || status_context == "approval"
 }
 
 /// Valid status values (ordered for display priority).
