@@ -273,7 +273,7 @@ impl Agent {
 
     /// True when PTY delivery is gate-blocked (daemon wrote a `tui:*` context).
     pub fn is_pty_blocked(&self) -> bool {
-        self.status_context.starts_with("tui:")
+        crate::shared::is_delivery_paused_status_context(&self.status_context)
     }
 }
 
