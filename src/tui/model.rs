@@ -1251,6 +1251,13 @@ mod tests {
     }
 
     #[test]
+    fn pty_blocked_with_hook_approval_context() {
+        let mut a = test_agent("nova");
+        a.status_context = "approval".into();
+        assert!(a.is_pty_blocked());
+    }
+
+    #[test]
     fn pty_not_blocked_without_tui_prefix() {
         let mut a = test_agent("nova");
         a.status_context = "tool:Bash".into();

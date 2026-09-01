@@ -1629,6 +1629,24 @@ mod tests {
 
     #[test]
     #[serial]
+    fn recipient_feedback_warns_for_hook_approval_block() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('hook-approval', 'blocked', 'approval', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let feedback = get_recipient_feedback(&db, &["hook-approval".to_string()]);
+
+        assert_eq!(feedback, "Queued; delivery paused: ■ hook-approval");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn recipient_feedback_lists_healthy_before_paused_recipients() {
         let (db, path, _env) = setup_test_db();
         insert_feedback_recipient(&db, "paused", "tui:user-active");
