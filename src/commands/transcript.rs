@@ -1436,6 +1436,26 @@ mod tests {
     }
 
     #[test]
+    fn known_agent_without_transcript_points_to_transport_history() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+             VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita");
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita.\n\
+View transport messages with: hcom events --agent pita --type message"
+        );
+        assert!(!error.contains("no messages have been exchanged"));
+    }
+
+    #[test]
     fn test_parse_range() {
         assert_eq!(parse_range("5"), (Some(5), Some(5)));
         assert_eq!(parse_range("3-10"), (Some(3), Some(10)));
