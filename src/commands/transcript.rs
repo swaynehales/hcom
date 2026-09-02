@@ -255,8 +255,8 @@ fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
 fn no_transcript_error(db: &HcomDb, name: &str) -> String {
     if let Some(resolved) = crate::identity::resolve_display_name_or_stopped(db, name) {
         format!(
-            "Agent '{}' has no transcript yet — no messages have been exchanged",
-            resolved
+            "No model transcript is registered for {resolved}.\n\
+View transport messages with: hcom events --agent {resolved} --type message"
         )
     } else {
         format!("Agent '{name}' not found")
