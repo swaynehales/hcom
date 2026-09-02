@@ -862,6 +862,48 @@ mod tests {
     }
 
     #[test]
+    fn test_adapter_attestation_accepts_one_ulp_generation_variance_only() {
+        let (db, db_path) = setup_full_test_db();
+        let receipt_generation = 1_788_315_180.618_200_3_f64;
+        let one_ulp_higher = f64::from_bits(receipt_generation.to_bits() + 1);
+        let two_ulps_higher = f64::from_bits(receipt_generation.to_bits() + 2);
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('pita', ?1)",
+                [one_ulp_higher],
+            )
+            .unwrap();
+
+        let request_id = db
+            .log_event(
+                "message",
+                "suki",
+                &serde_json::json!({
+                    "from": "suki",
+                    "mentions": ["pita"],
+                    "delivered_to": ["pita"],
+                    "text": "review"
+                }),
+            )
+            .unwrap();
+        db.log_event(
+            "receipt",
+            "pita",
+            &serde_json::json!({
+                "request_id": request_id,
+                "channel": "adapter_hook",
+                "hook": "Stop",
+                "instance_created_at": receipt_generation
+            }),
+        )
+        .unwrap();
+        assert!(!db.has_adapter_attestation("pita", two_ulps_higher));
+        assert!(db.has_adapter_attestation("pita", one_ulp_higher));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn test_adapter_attestation_rejects_untrusted_evidence() {
         let (db, db_path) = setup_full_test_db();
         db.conn
