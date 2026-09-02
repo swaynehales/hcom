@@ -5,6 +5,14 @@ use rusqlite::params;
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
 
+fn adapter_generation_matches(receipt: f64, current: f64) -> bool {
+    receipt.is_finite()
+        && current.is_finite()
+        && receipt >= 0.0
+        && current >= 0.0
+        && receipt.to_bits().abs_diff(current.to_bits()) <= 1
+}
+
 /// Message from the events table
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -126,7 +134,10 @@ impl HcomDb {
                     receipt.get("hook").and_then(|v| v.as_str()),
                     Some("UserPromptSubmit" | "Stop")
                 )
-                && receipt.get("instance_created_at").and_then(|v| v.as_f64()) == Some(created_at)
+                && receipt
+                    .get("instance_created_at")
+                    .and_then(|v| v.as_f64())
+                    .is_some_and(|token| adapter_generation_matches(token, created_at))
                 && request_id < receipt_id;
             if !valid_envelope {
                 continue;
