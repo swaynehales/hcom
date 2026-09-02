@@ -98,6 +98,63 @@ impl HcomDb {
         false
     }
 
+    /// Return whether the current instance generation has a valid Droid adapter receipt.
+    pub fn has_adapter_attestation(&self, name: &str, created_at: f64) -> bool {
+        let Ok(mut stmt) = self.conn().prepare(
+            "SELECT id, data FROM events \
+             WHERE type = 'receipt' AND instance = ?1 ORDER BY id DESC",
+        ) else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return false;
+        };
+
+        for row in rows.flatten() {
+            let (receipt_id, raw_receipt) = row;
+            let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&raw_receipt) else {
+                continue;
+            };
+            let Some(request_id) = receipt.get("request_id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let valid_envelope = receipt.get("channel").and_then(|v| v.as_str())
+                == Some("adapter_hook")
+                && matches!(
+                    receipt.get("hook").and_then(|v| v.as_str()),
+                    Some("UserPromptSubmit" | "Stop")
+                )
+                && receipt.get("instance_created_at").and_then(|v| v.as_f64()) == Some(created_at)
+                && request_id < receipt_id;
+            if !valid_envelope {
+                continue;
+            }
+            let request_data = self.conn().query_row(
+                "SELECT data FROM events WHERE id = ?1 AND type = 'message'",
+                [request_id],
+                |row| row.get::<_, String>(0),
+            );
+            let Ok(raw_request) = request_data else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&raw_request) else {
+                continue;
+            };
+            let addressed = ["delivered_to", "mentions"].iter().any(|field| {
+                request
+                    .get(field)
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(name)))
+            });
+            if addressed {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get unread messages for an instance
     ///
     /// Returns messages where:
