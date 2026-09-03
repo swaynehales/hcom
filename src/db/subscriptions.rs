@@ -191,6 +191,36 @@ fn instance_tool(db: &HcomDb, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether the request target's row says it is mid-turn *and* that row is at
+/// least as new as the edge being evaluated. An older row cannot vouch for a
+/// newer edge; an equal-or-newer `active`/`blocked` row means the edge was a
+/// transient side effect of delivery rather than idleness.
+fn target_busy_since(db: &HcomDb, target: &str, event_id: i64) -> bool {
+    let row: Option<(String, i64, i64)> = db
+        .conn
+        .query_row(
+            "SELECT i.status, i.status_time,
+                    CAST(strftime('%s', e.timestamp) AS INTEGER)
+             FROM instances i, events e
+             WHERE i.name = ?1 AND e.id = ?2",
+            params![target, event_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                ))
+            },
+        )
+        .ok();
+    match row {
+        Some((status, status_time, event_epoch)) => {
+            matches!(status.as_str(), "active" | "blocked") && status_time >= event_epoch
+        }
+        None => false,
+    }
+}
+
 fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller: &str) -> bool {
     if sub_caller.is_empty() {
         return false;
@@ -637,6 +667,18 @@ pub(crate) fn process_logged_event(
                             &format!("{e}"),
                         );
                     }
+                    continue;
+                }
+
+                // A `listening` edge is history by the time a subscriber
+                // evaluates it. If the target is working on the request right
+                // now (its row says `active` or `blocked`), the edge was a
+                // transient side effect of delivery, not idleness: re-arm past
+                // it and wait for a later edge.
+                if event_type == "status" && target_busy_since(db, target, event_id) {
+                    let mut sub_mut = sub.clone();
+                    sub_mut["last_id"] = serde_json::json!(event_id);
+                    kv_store_sub(db, key, &sub_mut);
                     continue;
                 }
 
@@ -1291,6 +1333,57 @@ mod tests {
             count_reqwatch_without_reply_notifications(&db, "gora"),
             before + 1,
             "non-agy listening should notify immediately"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_reqwatch_listening_edge_deferred_while_target_row_is_active() {
+        let (db, db_path) = setup_full_test_db();
+        setup_reqwatch_pair(&db, "gora", "nabe", "pi");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        // The edge lands, but by evaluation time the target reports active,
+        // with a status_time at least as new as the edge.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'active',
+                 status_time = CAST(strftime('%s', 'now') AS INTEGER) + 5
+                 WHERE name = 'nabe'",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "listening edge must not notify while the target row is active"
+        );
+
+        // Later the target really goes idle without replying: notify once.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening',
+                 status_time = CAST(strftime('%s', 'now') AS INTEGER) + 5
+                 WHERE name = 'nabe'",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "nabe",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "a listening edge on a listening row still notifies"
         );
         cleanup_test_db(db_path);
     }

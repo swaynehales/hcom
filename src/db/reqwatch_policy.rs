@@ -33,7 +33,12 @@ pub(crate) fn reqwatch_notify_decision(
     sub: &Value,
     now: f64,
 ) -> ReqwatchNotifyDecision {
-    if target_tool != "antigravity" {
+    // Antigravity and adapter-driven adhoc agents (the Droid adapter registers
+    // as `adhoc`) both emit a `listening` edge as a side effect of receiving:
+    // the delivering `hcom listen` writes `listening` after it has advanced
+    // the cursor, one to two seconds before the turn reports `active`. Give
+    // those tools the same grace so the edge alone does not read as idle.
+    if !matches!(target_tool, "antigravity" | "adhoc") {
         return ReqwatchNotifyDecision::Proceed;
     }
 
@@ -76,6 +81,18 @@ mod tests {
         assert_eq!(
             reqwatch_notify_decision("gemini", "status", &data, &sub, 0.0),
             ReqwatchNotifyDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn test_adhoc_listening_defers_like_antigravity() {
+        let sub = json!({});
+        let data = json!({"status": "listening"});
+        assert_eq!(
+            reqwatch_notify_decision("adhoc", "status", &data, &sub, 100.0),
+            ReqwatchNotifyDecision::Defer {
+                set_grace_if_absent: true
+            }
         );
     }
 
