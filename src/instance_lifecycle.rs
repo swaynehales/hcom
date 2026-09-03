@@ -505,7 +505,10 @@ pub fn get_status_description(status: &str, context: &str) -> String {
                 "listening: output streaming".to_string()
             } else if context == "tui:prompt-has-text" {
                 "listening: uncommitted text".to_string()
-            } else if let Some(reason) = context.strip_prefix("tui:") {
+            } else if let Some(reason) = context
+                .strip_prefix("tui:")
+                .or_else(|| context.strip_prefix("plugin:"))
+            {
                 format!("listening: {}", reason.replace('-', " "))
             } else if context == "suspended" {
                 "listening: suspended".to_string()

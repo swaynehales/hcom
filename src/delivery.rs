@@ -1707,6 +1707,79 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait in idle state before checking again.
 const IDLE_WAIT: Duration = Duration::from_secs(30);
 
+/// How long pending messages may sit unread by a plugin-delivered tool after
+/// its wake before the row is marked `plugin:wake-unacknowledged`.
+const PLUGIN_WAKE_ACK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Poll interval while pending messages are waiting on a plugin read.
+const PLUGIN_WAKE_ACK_POLL: Duration = Duration::from_secs(5);
+
+/// Status context published when a plugin wake went unacknowledged.
+const PLUGIN_WAKE_UNACKNOWLEDGED_CONTEXT: &str = "plugin:wake-unacknowledged";
+
+/// One step of plugin wake-acknowledgement tracking for the OpenCode-family
+/// delivery loop. Returns the updated `(pending_since, gate_published)` pair.
+///
+/// - pending and not yet timed: start the clock
+/// - pending past the window, gate not published: publish it (only while the
+///   row is `listening`, so a genuinely busy agent is never flagged)
+/// - nothing pending: clear our gate if we published it, reset the clock
+fn track_plugin_wake_ack(
+    db: &HcomDb,
+    name: &str,
+    pending_since: Option<Instant>,
+    gate_published: bool,
+) -> (Option<Instant>, bool) {
+    if db.has_pending(name) {
+        let since = pending_since.unwrap_or_else(Instant::now);
+        if !gate_published && since.elapsed() >= PLUGIN_WAKE_ACK_TIMEOUT {
+            let detail = "plugin did not read pending messages; resume this agent (hcom r)";
+            match db.set_gate_status_if_listening(name, PLUGIN_WAKE_UNACKNOWLEDGED_CONTEXT, detail)
+            {
+                Ok(true) => {
+                    log_warn(
+                        "native",
+                        "delivery.plugin_wake_unacknowledged",
+                        &format!(
+                            "Plugin wake was not acknowledged for {} within {}s; marking delivery paused",
+                            name,
+                            PLUGIN_WAKE_ACK_TIMEOUT.as_secs()
+                        ),
+                    );
+                    return (Some(since), true);
+                }
+                Ok(false) => {}
+                Err(e) => log_warn(
+                    "native",
+                    "delivery.plugin_gate_status_fail",
+                    &format!("{}", e),
+                ),
+            }
+        }
+        (Some(since), gate_published)
+    } else {
+        if gate_published {
+            match db.clear_gate_status_if_context(name, PLUGIN_WAKE_UNACKNOWLEDGED_CONTEXT) {
+                Ok(true) => log_info(
+                    "native",
+                    "delivery.plugin_wake_recovered",
+                    &format!(
+                        "{}: plugin drained pending messages; clearing paused gate",
+                        name
+                    ),
+                ),
+                Ok(false) => {}
+                Err(e) => log_warn(
+                    "native",
+                    "delivery.plugin_gate_clear_fail",
+                    &format!("{}", e),
+                ),
+            }
+        }
+        (None, false)
+    }
+}
+
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
@@ -1853,6 +1926,18 @@ pub fn run_delivery_loop(
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
 
+        // Plugin wake acknowledgement. `send` wakes the plugin's notify port,
+        // and a healthy plugin reads and acks within a second. A plugin whose
+        // process can no longer shell out (observed: its cwd was a pruned
+        // worktree) accepts the wake and never reads, while this row keeps the
+        // last status it wrote, so every send to it queues silently. Track how
+        // long pending messages have gone unread and publish a paused gate
+        // context once that exceeds the acknowledgement window, exactly as the
+        // Claude PTY path does with `tui:wake-unacknowledged`. The plugin
+        // draining the queue clears it again.
+        let mut pending_since: Option<Instant> = None;
+        let mut plugin_gate_published = false;
+
         while running.load(Ordering::Acquire) {
             refresh_title_state(TitleRefresh {
                 db,
@@ -1875,9 +1960,21 @@ pub fn run_delivery_loop(
             );
 
             // Wait for notify or timeout
-            notify.wait(IDLE_WAIT);
+            let wait = if pending_since.is_some() && !plugin_gate_published {
+                PLUGIN_WAKE_ACK_POLL
+            } else {
+                IDLE_WAIT
+            };
+            notify.wait(wait);
             if !running.load(Ordering::Acquire) {
                 break;
+            }
+
+            if first_message_injected {
+                let (since, published) =
+                    track_plugin_wake_ack(db, &current_name, pending_since, plugin_gate_published);
+                pending_since = since;
+                plugin_gate_published = published;
             }
 
             // First-message bootstrap: inject via PTY to create session in TUI.
@@ -2777,6 +2874,107 @@ mod tests {
             approval_scrape_latched: false,
             nav_overlay: false,
         }
+    }
+
+    #[test]
+    fn plugin_wake_ack_marks_paused_after_window_and_clears_on_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, created_at, tcp_mode)
+                 VALUES ('luvu', 'opencode', 'listening', '', 0, 1)",
+                [],
+            )
+            .unwrap();
+        let sender = crate::shared::SenderIdentity {
+            kind: crate::shared::SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        crate::commands::send::send_message(
+            &db,
+            &sender,
+            "ping",
+            None,
+            Some(&["luvu".to_string()]),
+        )
+        .unwrap();
+        assert!(db.has_pending("luvu"));
+
+        // First observation starts the clock, publishes nothing.
+        let (since, published) = track_plugin_wake_ack(&db, "luvu", None, false);
+        assert!(since.is_some());
+        assert!(!published);
+        assert_eq!(
+            db.get_instance_full("luvu")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+
+        // Past the window: gate published while the row is listening.
+        let old = Instant::now() - PLUGIN_WAKE_ACK_TIMEOUT - Duration::from_secs(1);
+        let (since, published) = track_plugin_wake_ack(&db, "luvu", Some(old), false);
+        assert!(since.is_some());
+        assert!(published);
+        let row = db.get_instance_full("luvu").unwrap().unwrap();
+        assert_eq!(row.status_context, PLUGIN_WAKE_UNACKNOWLEDGED_CONTEXT);
+        assert!(crate::shared::is_delivery_paused_status_context(
+            &row.status_context
+        ));
+
+        // A busy row is never flagged.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'active', status_context = '' WHERE name = 'luvu'",
+                [],
+            )
+            .unwrap();
+        let (_, published) = track_plugin_wake_ack(&db, "luvu", Some(old), false);
+        assert!(!published);
+        assert_eq!(
+            db.get_instance_full("luvu")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
+
+        // Plugin drains the queue: our gate clears and the clock resets.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening',
+                 status_context = ?1 WHERE name = 'luvu'",
+                rusqlite::params![PLUGIN_WAKE_UNACKNOWLEDGED_CONTEXT],
+            )
+            .unwrap();
+        let max_id: i64 = db
+            .conn()
+            .query_row("SELECT MAX(id) FROM events", [], |r| r.get(0))
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = ?1 WHERE name = 'luvu'",
+                rusqlite::params![max_id],
+            )
+            .unwrap();
+        assert!(!db.has_pending("luvu"));
+        let (since, published) = track_plugin_wake_ack(&db, "luvu", Some(old), true);
+        assert!(since.is_none());
+        assert!(!published);
+        assert_eq!(
+            db.get_instance_full("luvu")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            ""
+        );
     }
 
     fn observe_gate_status_within_feedback_deadline(

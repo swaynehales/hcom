@@ -294,6 +294,7 @@ fn strip_context_prefix(ctx: &str) -> &str {
         "denied:",
         "stale:",
         "tui:",
+        "plugin:",
     ];
     for p in PREFIXES {
         if let Some(rest) = ctx.strip_prefix(p) {

@@ -72,9 +72,15 @@ pub const ST_ERROR: &str = "error";
 /// Status-context prefix used while PTY delivery is held at a TUI safety gate.
 const TUI_DELIVERY_PAUSED_STATUS_PREFIX: &str = "tui:";
 
-/// Whether queued messages cannot currently be submitted through the target's PTY.
+/// Status-context prefix used while a plugin-delivered tool (OpenCode family)
+/// has been woken for pending messages and its plugin has not read them.
+const PLUGIN_DELIVERY_PAUSED_STATUS_PREFIX: &str = "plugin:";
+
+/// Whether queued messages cannot currently be submitted to the target
+/// (PTY gate, approval prompt, or an unacknowledged plugin wake).
 pub fn is_delivery_paused_status_context(status_context: &str) -> bool {
     status_context.starts_with(TUI_DELIVERY_PAUSED_STATUS_PREFIX)
+        || status_context.starts_with(PLUGIN_DELIVERY_PAUSED_STATUS_PREFIX)
         || status_context == "pty:approval"
         || status_context == "approval"
 }
@@ -254,5 +260,15 @@ mod tests {
         assert_eq!(STATUS_ORDER.len(), 6);
         assert_eq!(STATUS_ORDER[0], ST_ACTIVE);
         assert_eq!(STATUS_ORDER[5], ST_INACTIVE);
+    }
+
+    #[test]
+    fn plugin_wake_unacknowledged_counts_as_paused() {
+        assert!(is_delivery_paused_status_context(
+            "plugin:wake-unacknowledged"
+        ));
+        assert!(is_delivery_paused_status_context("tui:wake-unacknowledged"));
+        assert!(!is_delivery_paused_status_context("deliver:neso"));
+        assert!(!is_delivery_paused_status_context(""));
     }
 }
