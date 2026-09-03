@@ -1,6 +1,6 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
-import { appendFileSync } from "fs"
+import { appendFileSync, existsSync } from "fs"
 import { homedir } from "os"
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
@@ -105,7 +105,7 @@ function log(
   try { appendFileSync(LOG_PATH, entry + "\n") } catch {}
 }
 
-export const HcomPlugin: Plugin = async ({ client, $ }) => {
+export const HcomPlugin: Plugin = async ({ client, $, directory }: { client: any; $: any; directory?: string }) => {
   let hcomChecked = false
   let hcomAvailable = false
   let instanceName: string | null = null      // IDEN-03: bound instance name
@@ -126,8 +126,34 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
   let currentAgent: string | null = launchedAgent
   let currentModel: PromptModel | null = launchedModel
 
+  // OpenCode hands the plugin a shell whose default cwd is the project
+  // directory. If that directory is removed while the session is open (a
+  // pruned worktree is the observed case), every `$` spawn throws "No such
+  // file or directory" even under nothrow(), while process.cwd() stays valid,
+  // so status, idle delivery and acks all stop and hcom keeps showing the
+  // last status written. Detect the missing directory and repoint the shell
+  // at the home directory, once, and say so.
+  let cwdRecovered = false
+  function ensureCwd(): void {
+    if (cwdRecovered) return
+    let missing = false
+    if (directory && !existsSync(directory)) missing = true
+    try { process.cwd() } catch { missing = true }
+    if (!missing) return
+    cwdRecovered = true
+    try {
+      const home = homedir()
+      try { process.chdir(home) } catch {}
+      if (typeof $.cwd === "function") $.cwd(home)
+      log("WARN", "plugin.cwd_recovered", instanceName, { missing_dir: directory ?? null, new_cwd: home })
+    } catch (e) {
+      log("ERROR", "plugin.cwd_recover_failed", instanceName, { error: String(e) })
+    }
+  }
+
   // SAFE-02: Lazy PATH detection on first hook callback
   function checkHcom(): boolean {
+    ensureCwd()
     if (!hcomChecked) {
       hcomChecked = true
       hcomAvailable = Bun.which("hcom") !== null
@@ -343,6 +369,7 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
           open(socket) {
             socket.end()
             log("DEBUG", "notify_server.wake", instanceName, { status: lastReportedStatus, pending_ack: pendingAckId })
+            ensureCwd()
             if (sessionId && instanceName) deliverPendingToIdle(sessionId)
           },
           data() {},
