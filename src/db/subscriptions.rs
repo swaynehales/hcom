@@ -252,9 +252,16 @@ fn kv_store_sub(db: &HcomDb, key: &str, sub: &serde_json::Value) {
 }
 
 /// Clear agy grace timers when the target is working again (deliver/tool/active).
+/// Tools whose `listening` edges get an idle grace before a request watch
+/// notifies: Antigravity, and adapter-driven adhoc agents (the Droid adapter),
+/// which both emit `listening` as a side effect of receiving.
+fn reqwatch_grace_tool(target_tool: Option<&str>) -> bool {
+    matches!(target_tool, Some("antigravity") | Some("adhoc"))
+}
+
 fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
     for (key, sub, filters) in load_reqwatch_subs(db) {
-        if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity") {
+        if !reqwatch_grace_tool(filters.get("target_tool").and_then(|v| v.as_str())) {
             continue;
         }
         if filters.get("target").and_then(|v| v.as_str()) != Some(target) {
@@ -277,7 +284,7 @@ fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
 /// observe the same row, but only one can remove it and emit the one-shot notice.
 fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
     for (key, sub, filters) in load_reqwatch_subs(db) {
-        if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity")
+        if !reqwatch_grace_tool(filters.get("target_tool").and_then(|v| v.as_str()))
             || !super::reqwatch_policy::idle_grace_expired(&sub, now)
         {
             continue;
@@ -310,7 +317,7 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
                 "DELETE FROM kv
                  WHERE key = ?1
                    AND CAST(json_extract(value, '$.idle_grace_until') AS REAL) <= ?2
-                   AND json_extract(value, '$.filters.target_tool') = 'antigravity'
+                   AND json_extract(value, '$.filters.target_tool') IN ('antigravity', 'adhoc')
                    AND EXISTS (
                        SELECT 1 FROM instances
                        WHERE name = ?3 AND status = 'listening' AND last_event_id >= ?4
@@ -1526,6 +1533,45 @@ mod tests {
             count_reqwatch_without_reply_notifications(&db, "gora"),
             before,
             "a reply during grace must suppress the idle notice"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_adhoc_reqwatch_delivery_edge_then_stop_edge_defers_both() {
+        // Adapter Droid: the keepalive listen writes `listening` when it
+        // receives the request, PreToolUse reports `active` at once, and the
+        // turn-end `Stop` listen writes `listening` again while the agent is
+        // about to act on the delivered message. Neither edge is idleness.
+        let (db, db_path) = setup_full_test_db();
+        setup_reqwatch_pair(&db, "gora", "lofu", "adhoc");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        db.set_status("lofu", "listening", "filter:listen").unwrap();
+        db.log_event(
+            "status",
+            "lofu",
+            &serde_json::json!({"status": "listening", "context": "filter:listen"}),
+        )
+        .unwrap();
+        db.set_status("lofu", "active", "tool:Execute").unwrap();
+        db.log_event(
+            "status",
+            "lofu",
+            &serde_json::json!({"status": "active", "context": "tool:Execute"}),
+        )
+        .unwrap();
+        db.set_status("lofu", "listening", "ready").unwrap();
+        db.log_event(
+            "status",
+            "lofu",
+            &serde_json::json!({"status": "listening", "context": "ready"}),
+        )
+        .unwrap();
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "both listening edges fall inside a fresh grace"
         );
         cleanup_test_db(db_path);
     }
