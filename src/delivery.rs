@@ -707,6 +707,12 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
         "not_ready" => "prompt not visible",
         "output_unstable" => "output still streaming",
         "prompt_has_text" => "uncommitted text in prompt",
+        "prompt_has_hcom_text" => {
+            "hcom marker left in prompt; not hcom-owned, submit manually after checking input_text"
+        }
+        "stuck_submit_hcom_owned" => {
+            "hcom's own marker would not submit after retries; run: hcom term inject <name> --enter"
+        }
         "approval" => "waiting for user approval",
         "nav_overlay" => "waiting for subagent nav / session switcher to close",
         _ => "blocked",
@@ -726,6 +732,8 @@ fn gate_status_publication_delay(reason: &str) -> Duration {
         reason,
         "not_ready"
             | "prompt_has_text"
+            | "prompt_has_hcom_text"
+            | "stuck_submit_hcom_owned"
             | "user_active"
             | "approval"
             | "nav_overlay"
@@ -1638,15 +1646,85 @@ enum PromptOwnership {
 }
 
 fn prompt_ownership(input_text: Option<&str>, injected_text: &str) -> PromptOwnership {
-    match input_text {
-        Some(input) if !injected_text.is_empty() && input == injected_text => {
-            PromptOwnership::Exclusive
-        }
-        Some(input) if !injected_text.is_empty() && input.contains(injected_text) => {
-            PromptOwnership::Mixed
-        }
+    // NRM-061: Antigravity's TUI has been observed rendering hcom's marker with a
+    // run of spaces inserted after `<hcom>` (58 in one instance, 15 in another).
+    // A whitespace-only difference is still hcom's own text; anything else is not.
+    let injected = normalize_prompt_whitespace(injected_text);
+    match input_text.map(normalize_prompt_whitespace) {
+        Some(input) if !injected.is_empty() && input == injected => PromptOwnership::Exclusive,
+        Some(input) if !injected.is_empty() && input.contains(&injected) => PromptOwnership::Mixed,
         _ => PromptOwnership::Other,
     }
+}
+
+/// Drop all whitespace for ownership comparison. hcom's marker has none between
+/// `<hcom>` and `[`, while the mangled render has a run there, so collapsing to
+/// one space would still miscompare (`@miro`, gate-1 review finding 1).
+fn normalize_prompt_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Does `text` look like a wake marker hcom writes (`<hcom>` or `<hcom>[...]</hcom>`)?
+/// Shape only: it says nothing about whether *this* process wrote it.
+fn is_hcom_marker_shaped(text: &str) -> bool {
+    let t = normalize_prompt_whitespace(text);
+    t == "<hcom>" || (t.starts_with("<hcom>[") && t.ends_with("</hcom>"))
+}
+
+/// Refine a blocked gate reason for the two NRM-061 shapes so status consumers
+/// can tell hcom's own stuck marker from an operator draft.
+///
+/// - `stuck_submit_hcom_owned`: the box holds exactly what this delivery thread
+///   injected and orphan recovery has exhausted its Enter budget.
+/// - `prompt_has_hcom_text`: the box holds hcom-shaped text this process did not
+///   inject (for example after a daemon restart). Never auto-submitted.
+/// - `prompt_has_text`: any other text; replaces `not_ready` when the only
+///   reason the ready footer is hidden is that text.
+fn refine_blocked_reason(
+    reason: &'static str,
+    input_text: Option<&str>,
+    injected_text: &str,
+    recovery_exhausted: bool,
+) -> &'static str {
+    if !matches!(reason, "not_ready" | "prompt_has_text") {
+        return reason;
+    }
+    let Some(input) = input_text.filter(|t| !t.trim().is_empty()) else {
+        return reason;
+    };
+    match prompt_ownership(Some(input), injected_text) {
+        PromptOwnership::Exclusive if recovery_exhausted => "stuck_submit_hcom_owned",
+        PromptOwnership::Exclusive => reason,
+        _ if is_hcom_marker_shaped(input) => "prompt_has_hcom_text",
+        // Antigravity hides its ready footer while the box has text, so an
+        // operator draft used to surface as `not_ready` ("prompt not visible").
+        // The box is visible and holds text: say so.
+        _ => "prompt_has_text",
+    }
+}
+
+/// Should `Pending` re-send Enter for a marker this thread injected that never
+/// submitted? Only when the gate stopped at a prompt-content reason (idle,
+/// approval, user-activity and settle checks already passed), the box holds
+/// exactly the injected text, and the retry budget remains.
+fn orphan_recovery_decision(
+    gate_reason: &str,
+    input_text: Option<&str>,
+    injected_text: &str,
+    recovery_attempt: u32,
+) -> bool {
+    matches!(gate_reason, "not_ready" | "prompt_has_text")
+        && recovery_attempt < MAX_ENTER_ATTEMPTS
+        && prompt_ownership(input_text, injected_text) == PromptOwnership::Exclusive
+}
+
+/// Diagnostic: force exactly one phase-1 timeout so the orphan-recovery path can
+/// be exercised on a live agent without waiting for the TUI to misrender.
+fn debug_phase1_fail_once() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CONSUMED: AtomicBool = AtomicBool::new(false);
+    std::env::var_os("HCOM_DEBUG_PHASE1_FAIL_ONCE").is_some()
+        && !CONSUMED.swap(true, Ordering::SeqCst)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2036,6 +2114,7 @@ pub fn run_delivery_loop(
         let mut attempt: u32 = 0;
         let mut inject_attempt: u32 = 0;
         let mut enter_attempt: u32 = 0;
+        let mut orphan_recovery_attempt: u32 = 0;
         let mut injected_text = String::new();
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
@@ -2225,6 +2304,7 @@ pub fn run_delivery_loop(
                             injected_text = text;
                             phase_started_at = Instant::now();
                             enter_attempt = 0;
+                            orphan_recovery_attempt = 0;
                             delivery_state = State::WaitTextRender;
                             continue; // Skip retry delay - now in WaitTextRender phase
                         } else {
@@ -2232,9 +2312,59 @@ pub fn run_delivery_loop(
                             attempt += 1;
                         }
                     } else {
+                        // NRM-061: a marker this thread injected can be left in the
+                        // box with no Enter ever sent (phase 1 saw a whitespace-mangled
+                        // render and timed out). The gate then blocks on the marker
+                        // forever. Re-send Enter for text hcom itself wrote, bounded.
+                        let (input_text_now, approval_now) = {
+                            let screen = state.screen.read().unwrap();
+                            (screen.input_text.clone(), screen.approval)
+                        };
+                        if !approval_now
+                            && orphan_recovery_decision(
+                                gate.reason,
+                                input_text_now.as_deref(),
+                                &injected_text,
+                                orphan_recovery_attempt,
+                            )
+                        {
+                            orphan_recovery_attempt += 1;
+                            log_warn(
+                                "native",
+                                "delivery.orphan_recovery",
+                                &format!(
+                                    "hcom's own marker sits unsubmitted (gate={}, recovery_attempt={}, input_text={:?}); sending Enter",
+                                    gate.reason, orphan_recovery_attempt, input_text_now
+                                ),
+                            );
+                            let update = gate_status_tracker.reset();
+                            gate_status_tracker.apply_update(db, &current_name, update);
+                            delivery_state = State::WaitTextClear;
+                            phase_started_at = Instant::now();
+                            enter_attempt = 0;
+                            inject_enter(state.inject_port);
+                            continue;
+                        }
+
+                        let blocked_reason = refine_blocked_reason(
+                            gate.reason,
+                            input_text_now.as_deref(),
+                            &injected_text,
+                            orphan_recovery_attempt >= MAX_ENTER_ATTEMPTS,
+                        );
+                        if blocked_reason != gate.reason && attempt == 0 {
+                            log_warn(
+                                "native",
+                                "delivery.gate_refined",
+                                &format!(
+                                    "{} -> {} (input_text={:?})",
+                                    gate.reason, blocked_reason, input_text_now
+                                ),
+                            );
+                        }
                         let update = gate_status_tracker.observe_blocked_for(
                             &current_name,
-                            gate.reason,
+                            blocked_reason,
                             Instant::now(),
                         );
                         gate_status_tracker.apply_update(db, &current_name, update);
@@ -2352,7 +2482,21 @@ pub fn run_delivery_loop(
                         );
                     }
 
-                    match phase1_decision(input_text.as_deref(), &injected_text, elapsed) {
+                    // The diagnostic converts one *rendered* marker into a timeout,
+                    // reproducing "text landed, ownership check failed, no Enter".
+                    // Firing before render would let Pending see an empty box and
+                    // inject a second marker (observed on a disposable, 2026-09-05).
+                    let mut decision =
+                        phase1_decision(input_text.as_deref(), &injected_text, elapsed);
+                    if decision == Phase1Decision::Rendered && debug_phase1_fail_once() {
+                        log_warn(
+                            "native",
+                            "delivery.debug_phase1_fail",
+                            "HCOM_DEBUG_PHASE1_FAIL_ONCE: marker rendered; forcing one phase-1 timeout",
+                        );
+                        decision = Phase1Decision::TimedOut;
+                    }
+                    match decision {
                         Phase1Decision::Rendered => {
                             log_info(
                                 "native",
@@ -3059,6 +3203,21 @@ mod tests {
         let observed =
             observe_gate_status_within_feedback_deadline(ToolConfig::antigravity(), screen);
 
+        // NRM-061: the footer is hidden *because* the box holds a draft, so the
+        // published reason names the draft rather than "prompt not visible".
+        assert_eq!(observed, ("listening".into(), "tui:prompt-has-text".into()));
+    }
+
+    #[test]
+    fn operator_blocking_gate_status_stays_not_ready_with_empty_box() {
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = true;
+        screen.input_text = Some(String::new());
+
+        let observed =
+            observe_gate_status_within_feedback_deadline(ToolConfig::antigravity(), screen);
+
         assert_eq!(observed, ("listening".into(), "tui:not-ready".into()));
     }
 
@@ -3292,6 +3451,209 @@ mod tests {
             prompt_ownership(Some("user draft"), "<hcom>"),
             PromptOwnership::Other,
         );
+    }
+
+    // ---- NRM-061: whitespace-mangled marker, orphan recovery, reason codes ----
+
+    const MOLA_INJECTED: &str = "<hcom>[inform:a1_launch_artifacts #167186] gale -> mola</hcom>";
+    const MOLA_RENDERED: &str = "<hcom>                                                          [inform:a1_launch_artifacts #167186] gale -> mola</hcom>";
+
+    #[test]
+    fn ownership_tolerates_whitespace_run_inside_marker() {
+        // Verbatim from hcom.log.2, mola 2026-09-05T15:32:13Z (58 spaces after `<hcom>`).
+        assert_eq!(
+            prompt_ownership(Some(MOLA_RENDERED), MOLA_INJECTED),
+            PromptOwnership::Exclusive
+        );
+        // koko 2026-09-05T17:22:56Z (15 spaces).
+        assert_eq!(
+            prompt_ownership(
+                Some("<hcom>               [request:transport_check #168360] nihe -> koko</hcom>"),
+                "<hcom>[request:transport_check #168360] nihe -> koko</hcom>"
+            ),
+            PromptOwnership::Exclusive
+        );
+    }
+
+    #[test]
+    fn ownership_still_refuses_operator_text_with_mangled_marker() {
+        let with_draft = format!("{MOLA_RENDERED} and my draft");
+        assert_eq!(
+            prompt_ownership(Some(&with_draft), MOLA_INJECTED),
+            PromptOwnership::Mixed
+        );
+        assert_eq!(
+            prompt_ownership(Some("<hcom>[inform #1] a -> b</hcom>"), MOLA_INJECTED),
+            PromptOwnership::Other
+        );
+        assert_eq!(
+            prompt_ownership(Some("   "), MOLA_INJECTED),
+            PromptOwnership::Other
+        );
+    }
+
+    #[test]
+    fn phase1_renders_mangled_marker_before_timeout() {
+        assert_eq!(
+            phase1_decision(
+                Some(MOLA_RENDERED),
+                MOLA_INJECTED,
+                Duration::from_millis(509)
+            ),
+            Phase1Decision::Rendered
+        );
+    }
+
+    #[test]
+    fn orphan_recovery_fires_only_for_owned_text_at_prompt_gates() {
+        assert!(orphan_recovery_decision(
+            "not_ready",
+            Some(MOLA_RENDERED),
+            MOLA_INJECTED,
+            0
+        ));
+        assert!(orphan_recovery_decision(
+            "prompt_has_text",
+            Some(MOLA_INJECTED),
+            MOLA_INJECTED,
+            2
+        ));
+        // budget exhausted
+        assert!(!orphan_recovery_decision(
+            "not_ready",
+            Some(MOLA_INJECTED),
+            MOLA_INJECTED,
+            MAX_ENTER_ATTEMPTS
+        ));
+        // operator text, mixed or unrelated: never
+        let mixed = format!("{MOLA_INJECTED} draft");
+        assert!(!orphan_recovery_decision(
+            "not_ready",
+            Some(&mixed),
+            MOLA_INJECTED,
+            0
+        ));
+        assert!(!orphan_recovery_decision(
+            "not_ready",
+            Some("my draft"),
+            MOLA_INJECTED,
+            0
+        ));
+        // nothing injected by this process (e.g. after restart): never
+        assert!(!orphan_recovery_decision(
+            "not_ready",
+            Some(MOLA_INJECTED),
+            "",
+            0
+        ));
+        // gates that mean "not now" rather than "prompt content": never
+        assert!(!orphan_recovery_decision(
+            "not_idle",
+            Some(MOLA_INJECTED),
+            MOLA_INJECTED,
+            0
+        ));
+        assert!(!orphan_recovery_decision(
+            "user_active",
+            Some(MOLA_INJECTED),
+            MOLA_INJECTED,
+            0
+        ));
+        assert!(!orphan_recovery_decision(
+            "approval",
+            Some(MOLA_INJECTED),
+            MOLA_INJECTED,
+            0
+        ));
+        assert!(!orphan_recovery_decision(
+            "submit_settle",
+            Some(MOLA_INJECTED),
+            MOLA_INJECTED,
+            0
+        ));
+    }
+
+    #[test]
+    fn blocked_reason_distinguishes_owned_stuck_marker_from_foreign_marker() {
+        // owned, budget exhausted
+        assert_eq!(
+            refine_blocked_reason("not_ready", Some(MOLA_RENDERED), MOLA_INJECTED, true),
+            "stuck_submit_hcom_owned"
+        );
+        // owned, budget remaining: recovery handles it, reason unchanged
+        assert_eq!(
+            refine_blocked_reason("not_ready", Some(MOLA_RENDERED), MOLA_INJECTED, false),
+            "not_ready"
+        );
+        // hcom-shaped but not this process's text (restart case)
+        assert_eq!(
+            refine_blocked_reason("prompt_has_text", Some(MOLA_INJECTED), "", false),
+            "prompt_has_hcom_text"
+        );
+        assert_eq!(
+            refine_blocked_reason("not_ready", Some("<hcom>"), "", true),
+            "prompt_has_hcom_text"
+        );
+        // operator draft stays a draft
+        assert_eq!(
+            refine_blocked_reason(
+                "prompt_has_text",
+                Some("fix the tests"),
+                MOLA_INJECTED,
+                true
+            ),
+            "prompt_has_text"
+        );
+        // a draft that hides the ready footer is still a draft, not "not ready"
+        assert_eq!(
+            refine_blocked_reason(
+                "not_ready",
+                Some("operator draft, do not submit"),
+                MOLA_INJECTED,
+                false
+            ),
+            "prompt_has_text"
+        );
+        // empty box: not_ready means the tool is genuinely not ready
+        assert_eq!(
+            refine_blocked_reason("not_ready", None, MOLA_INJECTED, true),
+            "not_ready"
+        );
+        assert_eq!(
+            refine_blocked_reason("not_ready", Some(""), MOLA_INJECTED, true),
+            "not_ready"
+        );
+        // non-prompt gates untouched
+        assert_eq!(
+            refine_blocked_reason("not_idle", Some(MOLA_INJECTED), MOLA_INJECTED, true),
+            "not_idle"
+        );
+    }
+
+    #[test]
+    fn marker_shape_detection() {
+        assert!(is_hcom_marker_shaped("<hcom>"));
+        assert!(is_hcom_marker_shaped(MOLA_RENDERED));
+        assert!(is_hcom_marker_shaped(
+            "<hcom>[3 new messages] | [inform #9] a -> b</hcom>"
+        ));
+        assert!(!is_hcom_marker_shaped("<hcom> draft"));
+        assert!(!is_hcom_marker_shaped("please <hcom>"));
+        assert!(!is_hcom_marker_shaped("draft"));
+    }
+
+    #[test]
+    fn nrm061_reasons_publish_immediately_with_detail() {
+        assert_eq!(
+            gate_status_publication_delay("stuck_submit_hcom_owned"),
+            Duration::ZERO
+        );
+        assert_eq!(
+            gate_status_publication_delay("prompt_has_hcom_text"),
+            Duration::ZERO
+        );
+        assert_ne!(gate_block_detail("stuck_submit_hcom_owned"), "blocked");
+        assert_ne!(gate_block_detail("prompt_has_hcom_text"), "blocked");
     }
 
     // ---- evaluate_gate tests ----
