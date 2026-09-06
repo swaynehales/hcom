@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
     validate_intent, validate_message,
@@ -281,6 +280,20 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     }
     if !pending.is_empty() {
         lines.push(format!("Queued; delivery pending: {}", pending.join(", ")));
+    }
+    lines.join("\n")
+}
+
+/// Append the message id to the first feedback line, and a resolution hint
+/// when anything is still queued. NRM-057: a queued notice without the id
+/// forced senders into event-log archaeology to find out what happened.
+fn with_message_id(feedback: String, message_id: i64) -> String {
+    let mut lines: Vec<String> = feedback.lines().map(str::to_string).collect();
+    if let Some(first) = lines.first_mut() {
+        first.push_str(&format!("  #{message_id}"));
+    }
+    if lines.iter().any(|l| l.starts_with("Queued;")) {
+        lines.push(format!("State: hcom events --msg {message_id}"));
     }
     lines.join("\n")
 }
@@ -1148,7 +1161,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
-    let feedback = get_recipient_feedback(db, &delivered_to);
+    let feedback = with_message_id(get_recipient_feedback(db, &delivered_to), event_id);
 
     // Show unread messages if instance context (full delivery with cursor advance)
     if matches!(sender_identity.kind, SenderKind::Instance) {
@@ -1158,9 +1171,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             if let Some(last) = messages.last()
                 && let Some(id) = last.event_id
             {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, &sender_identity.name, &updates);
+                db.advance_cursor(&sender_identity.name, id, "send");
             }
 
             // Separate subagent messages from main messages
@@ -1572,6 +1583,22 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    fn feedback_carries_message_id_and_resolution_hint_when_queued() {
+        assert_eq!(
+            with_message_id("Sent to: ◉ gale".into(), 42),
+            "Sent to: ◉ gale  #42"
+        );
+        assert_eq!(
+            with_message_id("Queued; delivery pending: ◉ koko".into(), 43),
+            "Queued; delivery pending: ◉ koko  #43\nState: hcom events --msg 43"
+        );
+        assert_eq!(
+            with_message_id("Sent to: ◉ a\nQueued; delivery paused: ◉ b".into(), 44),
+            "Sent to: ◉ a  #44\nQueued; delivery paused: ◉ b\nState: hcom events --msg 44"
+        );
     }
 
     fn insert_feedback_recipient(db: &HcomDb, name: &str, status_context: &str) {
