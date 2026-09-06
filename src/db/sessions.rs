@@ -198,6 +198,200 @@ impl HcomDb {
         }
     }
 
+    /// Advance an instance's read cursor and record what that delivered.
+    ///
+    /// NRM-057: the cursor advance *is* the delivery moment for every path
+    /// (hook, plugin, `listen`, `send`, CLI context), yet nothing recorded it,
+    /// so a sender could not tell delivered from never-delivered. This writes
+    /// one `delivery` event per advance that covers at least one message
+    /// addressed to `name`: `{via, from_id, to_id, message_ids, count}`.
+    /// Positioning writes that are not deliveries (launch, resume, rebind)
+    /// keep using `update_instance_position` and log nothing.
+    ///
+    /// Returns the delivered message ids.
+    pub fn advance_cursor(&self, name: &str, new_id: i64, via: &str) -> Vec<i64> {
+        let old_id = match self.get_instance_status(name) {
+            Ok(Some(status)) => status.last_event_id,
+            Ok(None) => return vec![],
+            Err(e) => {
+                crate::log::log_error("db", "advance_cursor.get_instance_status", &format!("{e}"));
+                return vec![];
+            }
+        };
+        if new_id <= old_id {
+            return vec![];
+        }
+
+        let delivered = self.message_ids_for(name, old_id, new_id);
+
+        // Record first, then move the cursor, inside one transaction: the PTY
+        // proxy polls the cursor and writes its own late record when it finds
+        // none, so a cursor visible before its record would double-record.
+        // A caller already inside a transaction cannot open another; then run
+        // unwrapped rather than leave the cursor unmoved (which would redeliver).
+        let own_txn = self.conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+        let rollback = |db: &Self| {
+            if own_txn {
+                let _ = db.conn.execute_batch("ROLLBACK");
+            }
+        };
+        let mut recorded_event = None;
+        if !delivered.is_empty() {
+            let data = serde_json::json!({
+                "via": via,
+                "from_id": old_id,
+                "to_id": new_id,
+                "message_ids": delivered,
+                "count": delivered.len(),
+            });
+            // A failed record must not pin the cursor: that would redeliver the
+            // same messages every turn (`@miro`, review finding 2). Move on
+            // without the record and say so.
+            match self.log_event("delivery", name, &data) {
+                Ok(event_id) => recorded_event = Some(event_id),
+                Err(e) => crate::log::log_error(
+                    "db",
+                    "advance_cursor.log_event",
+                    &format!("{name}: {e}; advancing cursor without a record"),
+                ),
+            }
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(new_id));
+        if let Err(e) = self.update_instance_fields(name, &updates) {
+            crate::log::log_error("db", "advance_cursor.update", &format!("{name}: {e}"));
+            rollback(self);
+            return vec![];
+        }
+        if own_txn && let Err(e) = self.conn.execute_batch("COMMIT") {
+            crate::log::log_error("db", "advance_cursor.commit", &format!("{name}: {e}"));
+            rollback(self);
+            return vec![];
+        }
+        if let Some(event_id) = recorded_event {
+            crate::log::log_info(
+                "db",
+                "delivery.recorded",
+                &format!(
+                    "{name}: #{event_id} via={via} messages={delivered:?} cursor {old_id}->{new_id}"
+                ),
+            );
+        }
+        delivered
+    }
+
+    /// Record a `delivery` event for messages in `(after_id, up_to_id]` addressed
+    /// to `name` that no record covers yet. For paths that learn of a delivery
+    /// after the cursor already moved (the PTY proxy observing a cursor advance
+    /// made by a positioning write). Returns the ids newly recorded.
+    pub fn record_delivery_if_missing(
+        &self,
+        name: &str,
+        after_id: i64,
+        up_to_id: i64,
+        via: &str,
+    ) -> Vec<i64> {
+        let missing: Vec<i64> = self
+            .message_ids_for(name, after_id, up_to_id)
+            .into_iter()
+            .filter(|id| self.delivery_record_for(name, *id).is_none())
+            .collect();
+        if missing.is_empty() {
+            return missing;
+        }
+        let data = serde_json::json!({
+            "via": via,
+            "from_id": after_id,
+            "to_id": up_to_id,
+            "message_ids": missing,
+            "count": missing.len(),
+        });
+        match self.log_event("delivery", name, &data) {
+            Ok(event_id) => crate::log::log_info(
+                "db",
+                "delivery.recorded",
+                &format!("{name}: #{event_id} via={via} messages={missing:?} (late record)"),
+            ),
+            Err(e) => crate::log::log_error(
+                "db",
+                "record_delivery_if_missing.log_event",
+                &format!("{name}: {e}"),
+            ),
+        }
+        missing
+    }
+
+    /// Ids of message events in `(after_id, up_to_id]` addressed to `name`.
+    pub fn message_ids_for(&self, name: &str, after_id: i64, up_to_id: i64) -> Vec<i64> {
+        let mut stmt = match self.conn.prepare_cached(
+            "SELECT id, data FROM events WHERE id > ? AND id <= ? AND type = 'message' ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::log::log_error("db", "message_ids_for.prepare", &format!("{e}"));
+                return vec![];
+            }
+        };
+        let rows = match stmt.query_map(params![after_id, up_to_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::log::log_error("db", "message_ids_for.query", &format!("{e}"));
+                return vec![];
+            }
+        };
+        rows.flatten()
+            .filter(|(_, data)| {
+                serde_json::from_str::<serde_json::Value>(data)
+                    .map(|json| Self::should_deliver_to(&json, name))
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The `delivery` event that covered message `message_id` for `name`, as
+    /// `(event_id, timestamp, via)`, if one was recorded.
+    pub fn delivery_record_for(
+        &self,
+        name: &str,
+        message_id: i64,
+    ) -> Option<(i64, String, String)> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT id, timestamp, data FROM events
+                 WHERE type = 'delivery' AND instance = ? AND id > ? ORDER BY id LIMIT 500",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map(params![name, message_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .ok()?;
+        for (id, ts, data) in rows.flatten() {
+            let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+            let covers = json
+                .get("message_ids")
+                .and_then(|v| v.as_array())
+                .is_some_and(|ids| ids.iter().any(|v| v.as_i64() == Some(message_id)));
+            if covers {
+                let via = json
+                    .get("via")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Some((id, ts, via));
+            }
+        }
+        None
+    }
+
     /// Check if instance has a session binding (session_id is set and non-empty).
     /// Used by OpenCode delivery thread to skip PTY injection when plugin is active.
     pub fn has_session(&self, name: &str) -> bool {
@@ -707,6 +901,133 @@ mod tests {
             .unwrap();
         assert!(db.has_pending("real"));
 
+        cleanup_test_db(db_path);
+    }
+
+    // ---- NRM-057: the cursor advance is the delivery record ----
+
+    fn insert_instance(db: &HcomDb, name: &str, cursor: i64) {
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, last_event_id) VALUES (?, 1.0, ?)",
+                params![name, cursor],
+            )
+            .unwrap();
+    }
+
+    fn insert_message(db: &HcomDb, from: &str, to: &str) -> i64 {
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-09-06T00:00:00', 'message', ?1, ?2)",
+                params![
+                    from,
+                    format!(
+                        r#"{{"from":"{from}","scope":"mentions","mentions":["{to}"],"delivered_to":["{to}"],"text":"hi"}}"#
+                    )
+                ],
+            )
+            .unwrap();
+        db.conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn advance_cursor_records_only_the_messages_it_delivered() {
+        let (db, db_path) = setup_full_test_db();
+        insert_instance(&db, "ana", 0);
+        let to_ana = insert_message(&db, "bob", "ana");
+        let to_cid = insert_message(&db, "bob", "cid");
+        let to_ana_2 = insert_message(&db, "bob", "ana");
+
+        let delivered = db.advance_cursor("ana", to_ana_2, "hook");
+
+        assert_eq!(delivered, vec![to_ana, to_ana_2]);
+        assert_eq!(db.get_cursor("ana"), to_ana_2);
+        let (instance, data): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT instance, data FROM events WHERE type = 'delivery' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(instance, "ana");
+        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(json["via"], "hook");
+        assert_eq!(json["from_id"], 0);
+        assert_eq!(json["to_id"], to_ana_2);
+        assert_eq!(json["count"], 2);
+        assert_eq!(json["message_ids"], serde_json::json!([to_ana, to_ana_2]));
+
+        assert!(db.delivery_record_for("ana", to_ana).is_some());
+        assert!(db.delivery_record_for("ana", to_cid).is_none());
+        assert!(db.delivery_record_for("cid", to_cid).is_none());
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn late_record_covers_only_unrecorded_messages_once() {
+        let (db, db_path) = setup_full_test_db();
+        insert_instance(&db, "ana", 0);
+        let m1 = insert_message(&db, "bob", "ana");
+        let m2 = insert_message(&db, "bob", "ana");
+        // The hook recorded m1; a positioning write then moved the cursor past m2.
+        assert_eq!(db.advance_cursor("ana", m1, "hook"), vec![m1]);
+        db.conn
+            .execute(
+                "UPDATE instances SET last_event_id = ?1 WHERE name = 'ana'",
+                [m2],
+            )
+            .unwrap();
+
+        assert_eq!(db.record_delivery_if_missing("ana", 0, m2, "pty"), vec![m2]);
+        let (_, _, via) = db.delivery_record_for("ana", m2).unwrap();
+        assert_eq!(via, "pty");
+        let (_, _, via1) = db.delivery_record_for("ana", m1).unwrap();
+        assert_eq!(via1, "hook", "the hook's record stands");
+        // Idempotent.
+        assert!(
+            db.record_delivery_if_missing("ana", 0, m2, "pty")
+                .is_empty()
+        );
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'delivery'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn advance_cursor_without_addressed_messages_moves_cursor_silently() {
+        let (db, db_path) = setup_full_test_db();
+        insert_instance(&db, "ana", 0);
+        let to_cid = insert_message(&db, "bob", "cid");
+
+        assert!(db.advance_cursor("ana", to_cid, "listen").is_empty());
+        assert_eq!(db.get_cursor("ana"), to_cid);
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'delivery'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "no delivery event for a cursor move that delivered nothing"
+        );
+
+        // Backwards or equal never records or moves.
+        assert!(db.advance_cursor("ana", to_cid, "listen").is_empty());
+        assert!(db.advance_cursor("ana", 0, "listen").is_empty());
+        assert_eq!(db.get_cursor("ana"), to_cid);
+        // Unknown instance: nothing.
+        assert!(db.advance_cursor("ghost", to_cid, "listen").is_empty());
         cleanup_test_db(db_path);
     }
 

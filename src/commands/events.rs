@@ -46,6 +46,9 @@ pub struct EventsArgs {
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
+    /// Resolve one message's delivery state per recipient (NRM-057)
+    #[arg(long)]
+    pub msg: Option<i64>,
     /// Fetch events from a remote device instead of local DB
     #[arg(long)]
     pub remote_fetch: bool,
@@ -170,6 +173,125 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
         "instance": event.get("instance"),
         "data": data,
     })
+}
+
+// ── Message delivery state (NRM-057) ─────────────────────────────────────
+
+/// One recipient's state for a message: delivered, queued, paused, or gone.
+fn recipient_state(
+    db: &HcomDb,
+    name: &str,
+    message_id: i64,
+    message_ts_epoch: Option<i64>,
+) -> String {
+    use crate::shared::constants::is_delivery_paused_status_context;
+    use crate::shared::time::{format_age, now_epoch_i64};
+
+    // The record outlives the instance: a killed agent that was delivered to
+    // is still "delivered" (`@miro`, review finding 5).
+    if let Some((_, ts, via)) = db.delivery_record_for(name, message_id) {
+        return format!("{name}: delivered {} via {via}", &ts[..ts.len().min(19)]);
+    }
+    let Ok(Some(row)) = db.get_instance_full(name) else {
+        return format!("{name}: gone (no instance row; message can no longer be delivered)");
+    };
+    if row.last_event_id >= message_id {
+        return format!(
+            "{name}: delivered (cursor passed it; no delivery record: advanced before NRM-057 or by a positioning write)"
+        );
+    }
+    let waiting = message_ts_epoch
+        .map(|t| format!(" for {}", format_age(now_epoch_i64().saturating_sub(t))))
+        .unwrap_or_default();
+    let context = row.status_context.as_str();
+    if is_delivery_paused_status_context(context) {
+        let reason = context
+            .strip_prefix("tui:")
+            .unwrap_or(context)
+            .replace('-', "_");
+        let detail = crate::delivery::gate_block_detail(&reason);
+        let detail = if detail == "blocked" {
+            row.status_detail.as_str()
+        } else {
+            detail
+        };
+        return format!("{name}: paused{waiting}: {context} ({detail})");
+    }
+    if row.status == crate::shared::constants::ST_INACTIVE {
+        return format!("{name}: unreachable{waiting}: instance inactive");
+    }
+    let ctx = if context.is_empty() {
+        String::new()
+    } else {
+        format!(" ({context})")
+    };
+    format!("{name}: queued{waiting}: {}{ctx}", row.status)
+}
+
+/// Resolve a message's delivery state for every recipient, from hcom alone.
+fn message_state(db: &HcomDb, message_id: i64) -> Result<String, String> {
+    let (ts, etype, data): (String, String, String) = db
+        .conn()
+        .query_row(
+            "SELECT timestamp, type, data FROM events WHERE id = ?",
+            [message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| format!("no event #{message_id}"))?;
+    if etype != "message" {
+        return Err(format!(
+            "event #{message_id} is a {etype} event, not a message"
+        ));
+    }
+    let data: Value = serde_json::from_str(&data).unwrap_or(json!({}));
+    let from = data.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+    let scope = data
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("broadcast");
+    let mut recipients: Vec<String> = data
+        .get("delivered_to")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if recipients.is_empty() && scope == "broadcast" {
+        recipients = db
+            .iter_instances_full()
+            .map_err(|e| format!("{e}"))?
+            .into_iter()
+            .map(|r| r.name)
+            .filter(|n| n != from)
+            .collect();
+    }
+    let ts_epoch = chrono::DateTime::parse_from_rfc3339(&ts)
+        .ok()
+        .map(|t| t.timestamp())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|t| t.and_utc().timestamp())
+        });
+
+    let mut out = vec![format!(
+        "#{message_id} from {from} to {} sent {}",
+        if recipients.is_empty() {
+            "(nobody)".to_string()
+        } else {
+            recipients.join(", ")
+        },
+        &ts[..ts.len().min(19)]
+    )];
+    for name in &recipients {
+        out.push(format!(
+            "  {}",
+            recipient_state(db, name, message_id, ts_epoch)
+        ));
+    }
+    Ok(out.join("\n"))
 }
 
 // ── Query events from DB ─────────────────────────────────────────────────
@@ -1025,6 +1147,19 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     let sql_where = args.sql.as_ref().map(|s| s.replace("\\!", "!"));
     let wait_timeout = args.wait;
 
+    if let Some(message_id) = args.msg {
+        return match message_state(db, message_id) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                1
+            }
+        };
+    }
+
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
     resolve_filter_names(&mut filters, db);
@@ -1237,6 +1372,138 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- NRM-057: `hcom events --msg ID` resolves per-recipient state ----
+
+    fn state_test_db() -> (HcomDb, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let db_path = std::env::temp_dir().join(format!(
+            "test_hcom_events_state_{}_{}.db",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        (HcomDb::open_at(&db_path).unwrap(), db_path)
+    }
+
+    fn state_cleanup(path: std::path::PathBuf) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    fn state_instance(db: &HcomDb, name: &str, cursor: i64, status: &str, context: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, last_event_id, status, status_context, status_detail)
+                 VALUES (?1, 1.0, ?2, ?3, ?4, '')",
+                rusqlite::params![name, cursor, status, context],
+            )
+            .unwrap();
+    }
+
+    fn state_message(db: &HcomDb, from: &str, to: &[&str]) -> i64 {
+        let to_json = serde_json::to_string(to).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-09-06T00:00:00', 'message', ?1, ?2)",
+                rusqlite::params![
+                    from,
+                    format!(
+                        r#"{{"from":"{from}","scope":"mentions","mentions":{to_json},"delivered_to":{to_json},"text":"hi"}}"#
+                    )
+                ],
+            )
+            .unwrap();
+        db.conn().last_insert_rowid()
+    }
+
+    #[test]
+    fn message_state_resolves_delivered_queued_paused_and_gone() {
+        let (db, path) = state_test_db();
+        state_instance(&db, "dela", 0, "listening", "");
+        state_instance(&db, "quen", 0, "listening", "");
+        state_instance(&db, "paus", 0, "listening", "tui:prompt-has-hcom-text");
+        let id = state_message(&db, "bob", &["dela", "quen", "paus", "gone"]);
+        // dela read it through the recorded path.
+        assert_eq!(db.advance_cursor("dela", id, "hook"), vec![id]);
+
+        let text = message_state(&db, id).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!("#{id} from bob to dela, quen, paus, gone sent 2026-09-06T00:00:00")
+        );
+        assert!(lines[1].starts_with("  dela: delivered "), "{}", lines[1]);
+        assert!(lines[1].ends_with(" via hook"), "{}", lines[1]);
+        assert!(lines[2].starts_with("  quen: queued for "), "{}", lines[2]);
+        assert!(lines[2].ends_with(": listening"), "{}", lines[2]);
+        assert!(lines[3].starts_with("  paus: paused for "), "{}", lines[3]);
+        assert!(
+            lines[3].contains("tui:prompt-has-hcom-text (hcom marker left in prompt"),
+            "{}",
+            lines[3]
+        );
+        assert!(
+            lines[4].starts_with("  gone: gone (no instance row"),
+            "{}",
+            lines[4]
+        );
+        state_cleanup(path);
+    }
+
+    #[test]
+    fn message_state_keeps_delivered_after_the_instance_is_gone() {
+        let (db, path) = state_test_db();
+        state_instance(&db, "dead", 0, "listening", "");
+        let id = state_message(&db, "bob", &["dead"]);
+        assert_eq!(db.advance_cursor("dead", id, "hook"), vec![id]);
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'dead'", [])
+            .unwrap();
+        let text = message_state(&db, id).unwrap();
+        assert!(text.contains("dead: delivered "), "{text}");
+        assert!(text.ends_with(" via hook"), "{text}");
+        state_cleanup(path);
+    }
+
+    #[test]
+    fn message_state_names_a_cursor_that_passed_without_a_record() {
+        let (db, path) = state_test_db();
+        state_instance(&db, "olde", 0, "listening", "");
+        let id = state_message(&db, "bob", &["olde"]);
+        // A positioning write (resume/launch) moved the cursor past it.
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = ?1 WHERE name = 'olde'",
+                [id],
+            )
+            .unwrap();
+        let text = message_state(&db, id).unwrap();
+        assert!(
+            text.contains("olde: delivered (cursor passed it; no delivery record"),
+            "{text}"
+        );
+        state_cleanup(path);
+    }
+
+    #[test]
+    fn message_state_rejects_missing_and_non_message_ids() {
+        let (db, path) = state_test_db();
+        assert_eq!(message_state(&db, 999).unwrap_err(), "no event #999");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-09-06T00:00:00', 'status', 'x', '{}')",
+                [],
+            )
+            .unwrap();
+        let sid = db.conn().last_insert_rowid();
+        assert_eq!(
+            message_state(&db, sid).unwrap_err(),
+            format!("event #{sid} is a status event, not a message")
+        );
+        state_cleanup(path);
+    }
 
     #[test]
     fn test_streamline_event_message() {

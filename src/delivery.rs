@@ -2687,6 +2687,17 @@ pub fn run_delivery_loop(
                                 cursor_before, current_cursor
                             ),
                         );
+                        // NRM-057: the hook usually records the delivery when it
+                        // advances the cursor. When the cursor moved by a positioning
+                        // write instead (Antigravity's first turn binds the session
+                        // and sets the cursor to the current max), the marker still
+                        // reached the agent through this PTY path: record it here.
+                        db.record_delivery_if_missing(
+                            &current_name,
+                            cursor_before,
+                            current_cursor,
+                            "pty",
+                        );
                         if db.has_pending(&current_name) {
                             log_info(
                                 "native",

@@ -1312,9 +1312,7 @@ fn end_task(db: &HcomDb, instance_name: &str, raw: &Value) -> Option<String> {
     let freeze_event_id = instance_data.last_event_id;
     let (last_event_id, stdout) = deliver_freeze_messages(db, instance_name, freeze_event_id);
 
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(last_event_id));
-    instances::update_instance_position(db, instance_name, &updates);
+    db.advance_cursor(instance_name, last_event_id, "hook");
 
     stdout
 }

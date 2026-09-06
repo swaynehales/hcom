@@ -10,7 +10,6 @@ use crate::claude_actor;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle as lifecycle;
-use crate::instances;
 #[cfg(test)]
 use crate::shared::SenderIdentity;
 use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
@@ -220,9 +219,7 @@ pub fn maybe_deliver_pending_messages(
     if let Some(last) = messages.last()
         && let Some(id) = last.event_id
     {
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(id));
-        instances::update_instance_position(db, &identity.name, &updates);
+        db.advance_cursor(&identity.name, id, "cli");
     }
 
     // Format with divider

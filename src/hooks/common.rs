@@ -289,12 +289,12 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 
 /// Commit a deferred delivery ack — advance cursor and set status.
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
+    db.advance_cursor(&ack.instance_name, ack.last_event_id, "hook");
     if ack.mark_announced {
+        let mut updates = serde_json::Map::new();
         updates.insert("name_announced".into(), serde_json::json!(true));
+        instances::update_instance_position(db, &ack.instance_name, &updates);
     }
-    instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
         db,

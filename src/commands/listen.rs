@@ -352,9 +352,7 @@ fn listen_loop(
             if let Some(last) = messages.last()
                 && let Some(id) = last.event_id
             {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, instance_name, &updates);
+                db.advance_cursor(instance_name, id, "listen");
             }
 
             // Set status based on tool type
@@ -607,9 +605,7 @@ fn filter_listen_loop(
             if let Some(last) = messages.last()
                 && let Some(id) = last.event_id
             {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, instance_name, &updates);
+                db.advance_cursor(instance_name, id, "listen");
             }
 
             // Check for subscription notification

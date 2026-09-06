@@ -218,9 +218,7 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
                     serde_json::json!({"error": format!("Invalid --up-to: {}", up_to)}).to_string(),
                 );
             };
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
+            db.advance_cursor(&name, ack_id, "pi");
             return (0, serde_json::json!({"acked_to": ack_id}).to_string());
         }
         if messages.is_empty() {
@@ -233,9 +231,7 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
             .filter(|id| *id > 0)
             .unwrap_or_else(|| db.get_last_event_id());
         if ack_id > 0 {
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
+            db.advance_cursor(&name, ack_id, "pi");
         }
         return (0, serde_json::json!({"acked": messages.len()}).to_string());
     }

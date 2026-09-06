@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
     validate_intent, validate_message,
@@ -281,6 +280,20 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     lines.join("\n")
 }
 
+/// Append the message id to the first feedback line, and a resolution hint
+/// when anything is still queued. NRM-057: a queued notice without the id
+/// forced senders into event-log archaeology to find out what happened.
+fn with_message_id(feedback: String, message_id: i64) -> String {
+    let mut lines: Vec<String> = feedback.lines().map(str::to_string).collect();
+    if let Some(first) = lines.first_mut() {
+        first.push_str(&format!("  #{message_id}"));
+    }
+    if lines.iter().any(|l| l.starts_with("Queued;")) {
+        lines.push(format!("State: hcom events --msg {message_id}"));
+    }
+    lines.join("\n")
+}
+
 /// Snapshot recipients whose static transport/origin can require PTY feedback sync.
 /// Dynamic pending/status state is the only data re-read during the poll loop.
 fn recipient_feedback_sync_candidates(db: &HcomDb, delivered_to: &[String]) -> Vec<String> {
@@ -456,6 +469,18 @@ pub fn send_message(
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
 ) -> Result<Vec<String>, String> {
+    send_message_with_id(db, identity, message, envelope, explicit_targets).map(|(_, to)| to)
+}
+
+/// `send_message`, also returning the message's event id so callers can
+/// print it and later resolve its delivery state (`hcom events --msg ID`).
+pub fn send_message_with_id(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    explicit_targets: Option<&[String]>,
+) -> Result<(i64, Vec<String>), String> {
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
@@ -518,7 +543,7 @@ pub fn send_message(
     };
 
     // Log event to DB
-    let _event_id = db
+    let event_id = db
         .log_event("message", &routing_instance, &data)
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
 
@@ -537,7 +562,7 @@ pub fn send_message(
             && delivery.effective_scope == MessageScope::Mentions
             && !delivery.is_thread_resolved
         {
-            create_request_watches(db, &identity.name, _event_id, &delivery.delivered_to);
+            create_request_watches(db, &identity.name, event_id, &delivery.delivered_to);
         }
     }
 
@@ -547,7 +572,7 @@ pub fn send_message(
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
 
-    Ok(delivery.delivered_to)
+    Ok((event_id, delivery.delivered_to))
 }
 
 /// Resolve reply_to to local event ID. Returns None if not found.
@@ -1086,7 +1111,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some();
 
-    let delivered_to = match send_message(
+    let (message_id, delivered_to) = match send_message_with_id(
         db,
         &sender_identity,
         &message,
@@ -1106,7 +1131,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
-    let feedback = get_recipient_feedback(db, &delivered_to);
+    let feedback = with_message_id(get_recipient_feedback(db, &delivered_to), message_id);
 
     // Show unread messages if instance context (full delivery with cursor advance)
     if matches!(sender_identity.kind, SenderKind::Instance) {
@@ -1116,9 +1141,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             if let Some(last) = messages.last()
                 && let Some(id) = last.event_id
             {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, &sender_identity.name, &updates);
+                db.advance_cursor(&sender_identity.name, id, "send");
             }
 
             // Separate subagent messages from main messages
@@ -1530,6 +1553,22 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    fn feedback_carries_message_id_and_resolution_hint_when_queued() {
+        assert_eq!(
+            with_message_id("Sent to: ◉ gale".into(), 42),
+            "Sent to: ◉ gale  #42"
+        );
+        assert_eq!(
+            with_message_id("Queued; delivery pending: ◉ koko".into(), 43),
+            "Queued; delivery pending: ◉ koko  #43\nState: hcom events --msg 43"
+        );
+        assert_eq!(
+            with_message_id("Sent to: ◉ a\nQueued; delivery paused: ◉ b".into(), 44),
+            "Sent to: ◉ a  #44\nQueued; delivery paused: ◉ b\nState: hcom events --msg 44"
+        );
     }
 
     fn insert_feedback_recipient(db: &HcomDb, name: &str, status_context: &str) {

@@ -454,7 +454,7 @@ fn parse_timestamp(s: &str) -> Result<String, String> {
 pub struct EventFilterArgs {
     #[arg(long)]
     pub agent: Vec<String>,
-    #[arg(long = "type", value_parser = clap::builder::PossibleValuesParser::new(["message", "status", "life"]))]
+    #[arg(long = "type", value_parser = clap::builder::PossibleValuesParser::new(["message", "status", "life", "delivery"]))]
     pub event_type: Vec<String>,
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["active", "listening", "blocked", "inactive", "launching", "error"]))]
     pub status: Vec<String>,
