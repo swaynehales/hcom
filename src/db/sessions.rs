@@ -375,7 +375,10 @@ impl HcomDb {
             })
             .ok()?;
         for (id, ts, data) in rows.flatten() {
-            let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+            // One malformed record must not hide every later one (`@leka`, NRM-058 review).
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
             let covers = json
                 .get("message_ids")
                 .and_then(|v| v.as_array())
