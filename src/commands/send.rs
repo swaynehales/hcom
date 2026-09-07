@@ -526,16 +526,17 @@ pub fn send_message_with_id(
             if let Some(local_id) = resolve_reply_to_local(db, reply_to) {
                 data["reply_to_local"] = serde_json::json!(local_id);
 
-                // Ack-on-ack loop prevention
+                // An ack is a read receipt on any message, and it is terminal:
+                // acking an ack is the one shape refused, because it loops.
+                // Acking an inform used to be refused too ("informational
+                // messages don't need acknowledgment"), which left a sender of
+                // findings blind to whether they landed and pushed agents to
+                // dress receipts up as informs (nurmterm NRM-060/NRM-066).
                 if env.intent.as_ref().map(|i| i.as_str()) == Some("ack")
                     && let Some(parent_intent) = get_intent_from_event(db, local_id)
+                    && parent_intent == "ack"
                 {
-                    if parent_intent == "ack" {
-                        return Err("Ack-on-ack loop detected. Message blocked.".to_string());
-                    }
-                    if parent_intent == "inform" {
-                        return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
-                    }
+                    return Err("Ack-on-ack loop detected. Message blocked.".to_string());
                 }
             }
         }

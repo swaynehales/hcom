@@ -224,7 +224,10 @@ const SEND_HELP: &[HelpEntry] = &[
     ("  --intent <type>", "request | inform | ack"),
     ("", "  request: expect a response"),
     ("", "  inform: FYI, no response needed"),
-    ("", "  ack: replying to a request (requires --reply-to)"),
+    (
+        "",
+        "  ack: receipt of any message (requires --reply-to); terminal, never acked back",
+    ),
     ("  --reply-to <id>", "Link to event ID (42 or 42:BOXE)"),
     (
         "  --thread <name>",
