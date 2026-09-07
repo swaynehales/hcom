@@ -119,14 +119,30 @@ fn message_json(msg: &crate::db::Message) -> serde_json::Value {
 /// currently working should be marked idle on timeout. Borrowed from dibs's
 /// liveness rule that a quiet signal is not evidence of death when another
 /// signal says working (`internal/liveness`).
+///
+/// Deliberately reads the RAW stored status via `db::get_instance_status`, not
+/// the computed `instance_lifecycle::get_instance_status`, which applies
+/// staleness and would report a still-working agent as `inactive stale:*`
+/// after `STATUS_ACTIVITY_TIMEOUT` — reintroducing the demotion this guard
+/// exists to prevent. The two functions share a name; this one is correct here.
+///
+/// A failed read demotes, matching the pre-guard behaviour and `set_status`'s
+/// own failure direction, and warns for the same reason `set_status` does: a
+/// silent false demotion is the shape this fix removes.
+///
+/// The check and the write are separate statements, so a turn starting in the
+/// microseconds between them is still demoted. That residual is accepted: it
+/// replaces a window as long as the listen timeout, and the next listen's
+/// start or the staleness sweep corrects the row either way.
 fn instance_is_working(db: &HcomDb, instance_name: &str) -> bool {
-    matches!(
-        db.get_instance_status(instance_name)
-            .ok()
-            .flatten()
-            .map(|s| s.status),
-        Some(ref st) if st == ST_ACTIVE || st == ST_BLOCKED
-    )
+    match db.get_instance_status(instance_name) {
+        Ok(Some(s)) => s.status == ST_ACTIVE || s.status == ST_BLOCKED,
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!("[hcom] warn: exit:timeout guard DB read failed for {instance_name}: {e}");
+            false
+        }
+    }
 }
 
 fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
