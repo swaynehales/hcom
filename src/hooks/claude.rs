@@ -991,6 +991,34 @@ fn handle_sessionstart(
             common::TranscriptOwnerResolution::Unknown
                 if native_lineage_source && !fresh_process_placeholder =>
             {
+                // NRM-048: the transcript of a native generation change may
+                // not exist yet. Leave the binding alone (a switch to a
+                // foreign session must not be promoted on guesswork), but
+                // remember that this process saw the change so the first hook
+                // whose transcript proves the ancestry can finish the promotion.
+                if evidence.session_owner.is_none()
+                    && let Some(owner) = evidence.process_owner.as_deref()
+                    && let Some(process_id) = process_id
+                {
+                    match db.kv_set(
+                        &common::claude_lineage_pending_key(session_id),
+                        Some(process_id),
+                    ) {
+                        Ok(()) => log::log_info(
+                            "hooks",
+                            "sessionstart.lineage_deferred",
+                            &format!(
+                                "session_id={} source={} process_id={} process_owner={} mutated=false",
+                                session_id, source, process_id, owner
+                            ),
+                        ),
+                        Err(error) => log::log_warn(
+                            "hooks",
+                            "sessionstart.lineage_defer_failed",
+                            &format!("session_id={} err={}", session_id, error),
+                        ),
+                    }
+                }
                 log::log_warn(
                     "hooks",
                     "sessionstart.lineage_unknown",
@@ -3866,6 +3894,74 @@ mod tests {
                 .session_id
                 .as_deref(),
             Some("sess-old")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn native_fork_without_transcript_defers_promotion_for_owning_process() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('bero', 'sess-old', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-old", "bero");
+        db.set_process_binding("process-bero", "sess-old", "bero")
+            .unwrap();
+        let missing = hcom_dir.join("not-written-yet.jsonl");
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-bero".to_string());
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let raw = serde_json::json!({
+            "source": "fork",
+            "session_id": "sess-new",
+            "transcript_path": missing.to_string_lossy(),
+        });
+
+        let _ = handle_sessionstart(&db, &ctx, "sess-new", missing.to_str(), &raw);
+
+        // No mutation on guesswork ...
+        assert_eq!(db.get_session_binding("sess-new").unwrap(), None);
+        assert_eq!(
+            db.get_instance_full("bero")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-old")
+        );
+        // ... but the change is remembered for the owning process.
+        assert_eq!(
+            db.kv_get(&common::claude_lineage_pending_key("sess-new"))
+                .unwrap()
+                .as_deref(),
+            Some("process-bero")
+        );
+
+        // The transcript appears with fork ancestry; the next hook promotes.
+        std::fs::write(
+            &missing,
+            "{\"sessionId\":\"sess-new\",\"message\":{\"session_id\":\"sess-old\"}}\n",
+        )
+        .unwrap();
+        let (owner, _, is_primary) =
+            common::init_hook_context(&db, &ctx, "sess-new", missing.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("bero"));
+        assert!(is_primary);
+        assert_eq!(
+            db.get_session_binding("sess-new").unwrap().as_deref(),
+            Some("bero")
         );
     }
 

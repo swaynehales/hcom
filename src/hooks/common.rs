@@ -923,6 +923,13 @@ pub(crate) fn load_claude_identity_evidence(
     Ok(evidence)
 }
 
+/// kv key recording that SessionStart saw a native generation change
+/// (fork/startup/resume) for `session_id` on a bound process but could not
+/// yet read its transcript lineage. Value: the process id. NRM-048.
+pub(crate) fn claude_lineage_pending_key(session_id: &str) -> String {
+    format!("claude_lineage_pending:{session_id}")
+}
+
 /// Initialize instance context from hook data via binding lookup.
 ///
 /// Structured session/transcript identity wins over a conflicting process
@@ -1092,22 +1099,79 @@ pub fn init_hook_context(
         );
     }
 
+    let mut is_matched_resume = is_matched_resume;
     if evidence.lineage_scanned
         && matches!(&evidence.lineage, TranscriptOwnerResolution::Owner(owner) if owner == &name)
         && !is_matched_resume
     {
-        log::log_warn(
-            "hooks",
-            "init_hook_context.unpromoted_lineage_rejected",
-            &format!(
-                "session_id={} owner={} primary_session={:?} total_ms={:.2}",
+        // NRM-048: SessionStart may arrive before the new generation's
+        // transcript has any lineage to read (observed: `bero`, 2026-09-05,
+        // source=fork at 15:52:32, transcript_owners=Unknown). It then defers
+        // the promotion with a marker. The first hook whose transcript proves
+        // the ancestry, from the same process that owns the instance, completes
+        // it. Without this, every hook of the new generation is rejected for
+        // the life of the process and delivery is dead while the agent works.
+        let deferred_process = db
+            .kv_get(&claude_lineage_pending_key(session_id))
+            .ok()
+            .flatten();
+        let same_process = deferred_process.is_some()
+            && deferred_process.as_deref() == ctx.process_id.as_deref()
+            && evidence.process_owner.as_deref() == Some(name.as_str());
+        if same_process {
+            match db.attach_claude_generation(
+                &name,
                 session_id,
-                name,
-                instance.as_ref().and_then(|row| row.session_id.as_deref()),
-                start.elapsed().as_secs_f64() * 1000.0,
-            ),
-        );
-        return (None, serde_json::Map::new(), false);
+                transcript_path,
+                ctx.process_id.as_deref().unwrap_or(""),
+                evidence.process_owner.as_deref(),
+            ) {
+                Ok(_) => {
+                    let _ = db.kv_set(&claude_lineage_pending_key(session_id), None);
+                    if let Err(error) = db.mark_claude_session_validated(session_id, &name) {
+                        log::log_warn(
+                            "hooks",
+                            "init_hook_context.validation_cache_write_failed",
+                            &format!("session_id={} owner={} err={}", session_id, name, error),
+                        );
+                    }
+                    log::log_info(
+                        "hooks",
+                        "init_hook_context.deferred_lineage_promoted",
+                        &format!(
+                            "session_id={} owner={} previous_session={:?} process_id={:?}",
+                            session_id,
+                            name,
+                            instance.as_ref().and_then(|row| row.session_id.as_deref()),
+                            ctx.process_id,
+                        ),
+                    );
+                    is_matched_resume = true;
+                }
+                Err(error) => {
+                    log::log_warn(
+                        "hooks",
+                        "init_hook_context.deferred_lineage_promotion_failed",
+                        &format!("session_id={} owner={} err={}", session_id, name, error),
+                    );
+                    return (None, serde_json::Map::new(), false);
+                }
+            }
+        } else {
+            log::log_warn(
+                "hooks",
+                "init_hook_context.unpromoted_lineage_rejected",
+                &format!(
+                    "session_id={} owner={} primary_session={:?} deferred_process={:?} total_ms={:.2}",
+                    session_id,
+                    name,
+                    instance.as_ref().and_then(|row| row.session_id.as_deref()),
+                    deferred_process,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                ),
+            );
+            return (None, serde_json::Map::new(), false);
+        }
     }
 
     log::log_info(
@@ -2157,6 +2221,105 @@ mod tests {
         let (owner, _, _) =
             init_hook_context(&db, &ctx, "session-niza", transcript.to_str().unwrap());
         assert_eq!(owner.as_deref(), Some("niza"));
+    }
+
+    #[test]
+    fn hook_context_promotes_deferred_lineage_from_owning_process() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "bero", "session-old", "");
+        db.set_process_binding("process-bero", "session-old", "bero")
+            .unwrap();
+        db.kv_set(
+            &claude_lineage_pending_key("session-new"),
+            Some("process-bero"),
+        )
+        .unwrap();
+        let transcript = dir.path().join("fork-late.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"session-new\",\"message\":{\"session_id\":\"session-old\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-bero"));
+
+        let (owner, _, is_primary) =
+            init_hook_context(&db, &ctx, "session-new", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("bero"));
+        assert!(
+            is_primary,
+            "deferred promotion makes the new generation primary"
+        );
+        assert_eq!(
+            db.get_session_binding("session-new").unwrap().as_deref(),
+            Some("bero")
+        );
+        assert_eq!(
+            db.get_instance_full("bero")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("session-new")
+        );
+        assert!(
+            db.kv_get(&claude_lineage_pending_key("session-new"))
+                .unwrap()
+                .is_none(),
+            "marker is consumed"
+        );
+        // The next hook is an ordinary matched resume.
+        let (owner, _, is_primary) =
+            init_hook_context(&db, &ctx, "session-new", transcript.to_str().unwrap());
+        assert_eq!(owner.as_deref(), Some("bero"));
+        assert!(is_primary);
+    }
+
+    #[test]
+    fn hook_context_still_rejects_unpromoted_lineage_without_marker() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "bero", "session-old", "");
+        db.set_process_binding("process-bero", "session-old", "bero")
+            .unwrap();
+        let transcript = dir.path().join("fork-nomarker.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"session-new\",\"message\":{\"session_id\":\"session-old\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-bero"));
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-new", transcript.to_str().unwrap());
+        assert!(owner.is_none());
+        assert_eq!(db.get_session_binding("session-new").unwrap(), None);
+    }
+
+    #[test]
+    fn hook_context_ignores_marker_from_another_process() {
+        let (dir, db) = make_test_db();
+        insert_bound_claude_instance(&db, "bero", "session-old", "");
+        db.set_process_binding("process-bero", "session-old", "bero")
+            .unwrap();
+        db.kv_set(
+            &claude_lineage_pending_key("session-new"),
+            Some("process-other"),
+        )
+        .unwrap();
+        let transcript = dir.path().join("fork-otherproc.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"sessionId\":\"session-new\",\"message\":{\"session_id\":\"session-old\"}}\n",
+        )
+        .unwrap();
+        let ctx = context_with_process_id(dir.path(), Some("process-bero"));
+        let (owner, _, _) =
+            init_hook_context(&db, &ctx, "session-new", transcript.to_str().unwrap());
+        assert!(owner.is_none());
+        assert!(
+            db.kv_get(&claude_lineage_pending_key("session-new"))
+                .unwrap()
+                .is_some(),
+            "a foreign marker is left alone"
+        );
     }
 
     #[test]

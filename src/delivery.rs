@@ -1785,6 +1785,38 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait in idle state before checking again.
 const IDLE_WAIT: Duration = Duration::from_secs(30);
 
+/// NRM-048: after a Claude wake goes unacknowledged, re-wake at this spacing
+/// while the agent's row says it is idle, up to `WAKE_RETRY_MAX` times, instead
+/// of stopping for the life of the process. A healthy agent whose hooks were
+/// briefly unroutable (a generation change, a switched view) recovers on its
+/// own; a dead one costs three bare wakes and then rests.
+const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(180);
+const WAKE_RETRY_MAX: u32 = 3;
+
+/// Whether an unacknowledged-wake retry is due: `retries` already made, paused
+/// for `paused_for`.
+fn wake_retry_due(paused_for: Duration, retries: u32) -> bool {
+    retries < WAKE_RETRY_MAX && paused_for >= WAKE_RETRY_INTERVAL * (retries + 1)
+}
+
+/// Detail text published with `tui:wake-unacknowledged`. Truthful and
+/// non-destructive: nothing here tells an operator to kill a main session.
+fn wake_unacknowledged_detail(retries: u32) -> String {
+    if retries < WAKE_RETRY_MAX {
+        format!(
+            "delivery paused; wake not acknowledged (retry {}/{} in {}s; hooks deliver anyway when the agent's session is bound)",
+            retries + 1,
+            WAKE_RETRY_MAX,
+            WAKE_RETRY_INTERVAL.as_secs() * u64::from(retries + 1)
+        )
+    } else {
+        format!(
+            "delivery paused; {} wakes unacknowledged; check `hcom events --msg <id>`, and `hcom r <name>` only if the session is gone",
+            WAKE_RETRY_MAX
+        )
+    }
+}
+
 /// How long pending messages may sit unread by a plugin-delivered tool after
 /// its wake before the row is marked `plugin:wake-unacknowledged`.
 const PLUGIN_WAKE_ACK_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2119,6 +2151,9 @@ pub fn run_delivery_loop(
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
         let mut gate_status_tracker = GateStatusTracker::default();
+        // NRM-048 bounded re-wake bookkeeping.
+        let mut wake_paused_at: Option<Instant> = None;
+        let mut wake_retries: u32 = 0;
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -2687,6 +2722,8 @@ pub fn run_delivery_loop(
                                 cursor_before, current_cursor
                             ),
                         );
+                        wake_paused_at = None;
+                        wake_retries = 0;
                         // NRM-057: the hook usually records the delivery when it
                         // advances the cursor. When the cursor moved by a positioning
                         // write instead (Antigravity's first turn binds the session
@@ -2766,11 +2803,14 @@ pub fn run_delivery_loop(
                             }
                             VerifyTimeoutDecision::FastFail => {
                                 let context = "tui:wake-unacknowledged".to_string();
-                                let detail = "delivery paused; kill and resume this agent to retry";
+                                let detail = wake_unacknowledged_detail(wake_retries);
+                                if wake_paused_at.is_none() {
+                                    wake_paused_at = Some(Instant::now());
+                                }
                                 match db.set_gate_status_if_listening(
                                     &current_name,
                                     &context,
-                                    detail,
+                                    &detail,
                                 ) {
                                     Ok(true) => gate_status_tracker
                                         .record_published_for(&current_name, context),
@@ -2843,6 +2883,8 @@ pub fn run_delivery_loop(
                         gate_status_tracker.apply_update(db, &current_name, update);
                         attempt = 0;
                         inject_attempt = 0;
+                        wake_paused_at = None;
+                        wake_retries = 0;
                         delivery_state = if has_pending {
                             State::Pending
                         } else {
@@ -2856,6 +2898,32 @@ pub fn run_delivery_loop(
                                 current_name, cursor_before, current_cursor, has_pending
                             ),
                         );
+                    } else if let Some(paused_at) = wake_paused_at
+                        && wake_retry_due(paused_at.elapsed(), wake_retries)
+                        && db.is_idle(&current_name)
+                    {
+                        // NRM-048: bounded re-wake. The gate context stays
+                        // published until a delivery succeeds; only the detail
+                        // advances so the row tells the truth about what is
+                        // being tried.
+                        wake_retries += 1;
+                        let detail = wake_unacknowledged_detail(wake_retries);
+                        let _ = db.set_gate_status_if_listening(
+                            &current_name,
+                            "tui:wake-unacknowledged",
+                            &detail,
+                        );
+                        log_info(
+                            "native",
+                            "delivery.wake_retry",
+                            &format!(
+                                "Re-waking {} after unacknowledged wake (retry {}/{})",
+                                current_name, wake_retries, WAKE_RETRY_MAX
+                            ),
+                        );
+                        delivery_state = State::Pending;
+                        attempt = 0;
+                        inject_attempt = 0;
                     }
                 }
             }
@@ -3029,6 +3097,34 @@ mod tests {
             approval_scrape_latched: false,
             nav_overlay: false,
         }
+    }
+
+    #[test]
+    fn wake_retry_schedule_is_bounded_and_spaced() {
+        assert!(!wake_retry_due(Duration::from_secs(0), 0));
+        assert!(!wake_retry_due(
+            WAKE_RETRY_INTERVAL - Duration::from_secs(1),
+            0
+        ));
+        assert!(wake_retry_due(WAKE_RETRY_INTERVAL, 0));
+        assert!(!wake_retry_due(WAKE_RETRY_INTERVAL, 1));
+        assert!(wake_retry_due(WAKE_RETRY_INTERVAL * 2, 1));
+        assert!(wake_retry_due(WAKE_RETRY_INTERVAL * 3, 2));
+        assert!(
+            !wake_retry_due(Duration::from_secs(86_400), WAKE_RETRY_MAX),
+            "no retry past the cap, however long it has been"
+        );
+    }
+
+    #[test]
+    fn wake_unacknowledged_detail_never_tells_the_operator_to_kill() {
+        for retries in 0..=WAKE_RETRY_MAX {
+            let detail = wake_unacknowledged_detail(retries);
+            assert!(!detail.contains("kill"), "{detail}");
+            assert!(detail.starts_with("delivery paused"), "{detail}");
+        }
+        assert!(wake_unacknowledged_detail(0).contains("retry 1/3 in 180s"));
+        assert!(wake_unacknowledged_detail(WAKE_RETRY_MAX).contains("hcom events --msg"));
     }
 
     #[test]
