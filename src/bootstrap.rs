@@ -80,7 +80,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 1. Task via hcom → ack immediately, do work, report via hcom
 2. No filler messages (greetings, thanks, congratulations).
-3. Use --intent on sends: request (want reply), inform (dont need reply), ack (receipt of a request: needs --reply-to <id>, never on an inform).
+3. Use --intent on sends: request (want reply), inform (dont need reply), ack (receipt of any message: needs --reply-to <id>; terminal, never acked back).
 4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
@@ -216,7 +216,7 @@ Commands:
 Rules:
 - Task via hcom → ack, work, report
 - Authority: @{SENDER} > others
-- Use --intent on sends: request (want reply), inform (FYI), ack (receipt of a request: needs --reply-to, never on an inform)"#;
+- Use --intent on sends: request (want reply), inform (FYI), ack (receipt of any message: needs --reply-to; terminal, never acked back)"#;
 
 // HELPERS
 
