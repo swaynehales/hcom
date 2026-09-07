@@ -93,6 +93,23 @@ fn format_messages_json(
     }
 }
 
+/// One delivered message as a JSON object for `listen --json`.
+///
+/// Carries the same envelope fields the hook-native `[intent #id]` prefix is
+/// built from (`build_prefix`), so an external adapter can render the marker
+/// the `send` error text tells agents to look for. Before NRM-060 only
+/// `from` and `text` were emitted, which left adapter-delivered agents with
+/// no id to `ack` (nurmterm NRM-060).
+fn message_json(msg: &crate::db::Message) -> serde_json::Value {
+    serde_json::json!({
+        "from": msg.from,
+        "text": msg.text,
+        "intent": msg.intent,
+        "thread": msg.thread,
+        "id": msg.event_id,
+    })
+}
+
 fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
     let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
     let prefix = match (intent, thread) {
@@ -380,11 +397,10 @@ fn listen_loop(
 
             if json_output {
                 for msg in &messages {
-                    let j = serde_json::json!({
-                        "from": msg.from,
-                        "text": msg.text,
-                    });
-                    println!("{}", serde_json::to_string(&j).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string(&message_json(msg)).unwrap_or_default()
+                    );
                 }
             } else {
                 let formatted = format_messages_json(db, &messages, instance_name);
@@ -639,11 +655,10 @@ fn filter_listen_loop(
             if !real_messages.is_empty() {
                 if json_output {
                     for msg in &real_messages {
-                        let j = serde_json::json!({
-                            "from": msg.from,
-                            "text": msg.text,
-                        });
-                        println!("{}", serde_json::to_string(&j).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string(&message_json(msg)).unwrap_or_default()
+                        );
                     }
                 } else {
                     let owned: Vec<crate::db::Message> =
@@ -688,6 +703,27 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listen_json_carries_intent_and_id() {
+        let msg = crate::db::Message {
+            from: "luna".into(),
+            text: "please review".into(),
+            intent: Some("request".into()),
+            thread: None,
+            event_id: Some(165297),
+            timestamp: None,
+            delivered_to: None,
+            bundle_id: None,
+            relay: false,
+        };
+        let j = super::message_json(&msg);
+        assert_eq!(j["from"], "luna");
+        assert_eq!(j["text"], "please review");
+        assert_eq!(j["intent"], "request");
+        assert_eq!(j["id"], 165297);
+        assert!(j["thread"].is_null());
+    }
+
     use super::expand_sql_preset;
 
     #[test]
