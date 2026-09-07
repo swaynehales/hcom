@@ -221,6 +221,15 @@ fn target_busy_since(db: &HcomDb, target: &str, event_id: i64) -> bool {
     }
 }
 
+/// NRM-058: a request watch may only notify once hcom has *recorded* delivering
+/// the request to its target. The cursor is not evidence — positioning writes
+/// (launch, resume, rebind, Antigravity's first turn) move it without
+/// delivering — and a notice about an undelivered message is a false claim of
+/// non-response. No record, no notice; the watch stays armed until one exists.
+fn request_delivered(db: &HcomDb, target: &str, request_id: i64) -> bool {
+    db.delivery_record_for(target, request_id).is_some()
+}
+
 fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller: &str) -> bool {
     if sub_caller.is_empty() {
         return false;
@@ -304,6 +313,9 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
             let _ = db.kv_set(&key, None);
             continue;
         }
+        if !request_delivered(db, target, request_id) {
+            continue;
+        }
 
         let candidate_event_id = sub
             .get("idle_grace_event_id")
@@ -320,7 +332,15 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
                    AND json_extract(value, '$.filters.target_tool') IN ('antigravity', 'adhoc')
                    AND EXISTS (
                        SELECT 1 FROM instances
-                       WHERE name = ?3 AND status = 'listening' AND last_event_id >= ?4
+                       WHERE name = ?3 AND status = 'listening'
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM events d
+                       WHERE d.type = 'delivery' AND d.instance = ?3 AND d.id > ?4
+                         AND EXISTS (
+                             SELECT 1 FROM json_each(json_extract(d.data, '$.message_ids'))
+                             WHERE value = ?4
+                         )
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM events_v
@@ -651,15 +671,7 @@ pub(crate) fn process_logged_event(
                 .unwrap_or("");
             let sub_caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
             if request_id > 0 && !target.is_empty() {
-                let waterline: i64 = db
-                    .conn
-                    .query_row(
-                        "SELECT last_event_id FROM instances WHERE name = ?",
-                        params![target],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                if waterline < request_id {
+                if !request_delivered(db, target, request_id) {
                     let mut sub_mut = sub.clone();
                     sub_mut["last_id"] = serde_json::json!(event_id);
                     kv_store_sub(db, key, &sub_mut);
@@ -991,9 +1003,15 @@ fn format_sub_notification(
             } else {
                 "stopped"
             };
+            let delivered = f
+                .get("request_id")
+                .and_then(|v| v.as_i64())
+                .and_then(|rid| db.delivery_record_for(target, rid))
+                .map(|(_, ts, via)| format!(" (delivered {} via {via})", &ts[..ts.len().min(19)]))
+                .unwrap_or_default();
             return format!(
-                "[sub:{}] #{} {} {} without responding to your request #{}",
-                sub_id, event_id, target, action, request_id
+                "[sub:{}] #{} {} {} without responding to your request #{}{}",
+                sub_id, event_id, target, action, request_id, delivered
             );
         }
 
@@ -1248,6 +1266,42 @@ mod tests {
         });
         let request_id = db.log_event("message", requester, &req_data).unwrap();
         create_request_watches(db, requester, request_id, &[responder.to_string()]);
+        let delivered = db.advance_cursor(responder, request_id, "test");
+        assert_eq!(
+            delivered,
+            vec![request_id],
+            "helper must record the delivery"
+        );
+        request_id
+    }
+
+    /// Like `setup_reqwatch_pair`, but the cursor passes the request through a
+    /// positioning write — no delivery record, as on a launch/resume/rebind or
+    /// Antigravity's first turn.
+    fn setup_reqwatch_pair_cursor_only(
+        db: &HcomDb,
+        requester: &str,
+        responder: &str,
+        responder_tool: &str,
+    ) -> i64 {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, last_event_id, created_at)
+                 VALUES (?1, 'claude', 0, 1000.0), (?2, ?3, 0, 1000.0)",
+                params![requester, responder, responder_tool],
+            )
+            .unwrap();
+        let req_data = serde_json::json!({
+            "from": requester,
+            "sender_kind": "instance",
+            "scope": "mentions",
+            "text": "ping",
+            "delivered_to": [responder],
+            "intent": "request",
+            "mentions": [responder],
+        });
+        let request_id = db.log_event("message", requester, &req_data).unwrap();
+        create_request_watches(db, requester, request_id, &[responder.to_string()]);
         db.conn()
             .execute(
                 "UPDATE instances SET last_event_id = ?1 WHERE name = ?2",
@@ -1255,6 +1309,118 @@ mod tests {
             )
             .unwrap();
         request_id
+    }
+
+    // ---- NRM-058: no delivery record, no idle notice ----
+
+    #[test]
+    fn test_reqwatch_listening_before_any_delivery_never_notifies() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, last_event_id, created_at)
+                 VALUES ('gora', 'claude', 0, 1000.0), ('vito', 'gemini', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let req = serde_json::json!({
+            "from": "gora", "sender_kind": "instance", "scope": "mentions",
+            "text": "ping", "delivered_to": ["vito"], "intent": "request",
+            "mentions": ["vito"],
+        });
+        let request_id = db.log_event("message", "gora", &req).unwrap();
+        create_request_watches(&db, "gora", request_id, &["vito".to_string()]);
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        // gemini has no grace: pre-fix this fired on the first listening edge.
+        for _ in 0..3 {
+            db.log_event(
+                "status",
+                "vito",
+                &serde_json::json!({"status": "listening", "context": ""}),
+            )
+            .unwrap();
+        }
+        db.log_event("life", "vito", &serde_json::json!({"action": "stopped"}))
+            .unwrap();
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "no delivery record: idle and stop edges must not notify"
+        );
+        let sub_key = format!("events_sub:reqwatch-{request_id}-vito");
+        assert!(db.kv_get(&sub_key).unwrap().is_some(), "watch stays armed");
+
+        // Deliver it; the next idle edge is a real non-response.
+        db.advance_cursor("vito", request_id, "hook");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "after delivery the idle edge notifies"
+        );
+        let text: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') LIKE '%without responding%' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            text.contains("(delivered ") && text.contains("via hook)"),
+            "notice names the delivery it is about: {text}"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_reqwatch_cursor_passed_without_record_does_not_notify() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair_cursor_only(&db, "gora", "vito", "gemini");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "a positioning write is not a delivery"
+        );
+        let sub_key = format!("events_sub:reqwatch-{request_id}-vito");
+        assert!(db.kv_get(&sub_key).unwrap().is_some());
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_agy_reqwatch_grace_sweep_requires_delivery_record() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair_cursor_only(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+        db.set_status("nabe", "listening", "").unwrap();
+        // Force an expired grace onto the row as a stale-state guard.
+        let mut sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        sub["idle_grace_until"] = serde_json::json!(1.0);
+        kv_store_sub(&db, &sub_key, &sub);
+        sweep_expired_reqwatch_graces(&db, 2.0);
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "sweep must not notify without a delivery record"
+        );
+        assert!(db.kv_get(&sub_key).unwrap().is_some(), "watch not claimed");
+        cleanup_test_db(db_path);
     }
 
     #[test]
