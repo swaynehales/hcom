@@ -283,8 +283,14 @@ fn message_state(db: &HcomDb, message_id: i64) -> Result<String, String> {
                 .map(|t| t.and_utc().timestamp())
         });
 
+    // NRM-064: a re-addressed copy names its original (`@fome`, review Q2).
+    let readdressed = data
+        .get("readdressed_from")
+        .and_then(|v| v.as_i64())
+        .map(|orig| format!(" (re-addressed from #{orig})"))
+        .unwrap_or_default();
     let mut out = vec![format!(
-        "#{message_id} from {from} to {} sent {}",
+        "#{message_id} from {from} to {} sent {}{readdressed}",
         if recipients.is_empty() {
             "(nobody)".to_string()
         } else {
@@ -1446,6 +1452,16 @@ mod tests {
                 "  haro: re-addressed to buna as #{copy}; buna: queued"
             )),
             "{line}"
+        );
+        // The copy points back at its original.
+        let copy_text = message_state(&db, copy).unwrap();
+        assert!(
+            copy_text
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!("(re-addressed from #{original})")),
+            "{copy_text}"
         );
         // Once buna reads the copy, the original resolves as delivered through it.
         assert_eq!(db.advance_cursor("buna", copy, "hook"), vec![copy]);
