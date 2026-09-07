@@ -248,11 +248,17 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     let mut healthy = Vec::new();
     let mut paused = Vec::new();
     let mut pending = Vec::new();
+    let mut placeholders = Vec::new();
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
             let display = identity::get_display_name(db, name);
             let recipient = format!("{icon} {display}");
+            if crate::instances::is_launching_placeholder(&data) {
+                // NRM-064: a launch/resume placeholder is a temporary name;
+                // the recipient is still listed, the note is added below.
+                placeholders.push(recipient.clone());
+            }
             if is_delivery_paused_status_context(&data.status_context) {
                 paused.push(recipient);
             } else if unresolved.contains(name.as_str()) {
@@ -276,6 +282,12 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     }
     if !pending.is_empty() {
         lines.push(format!("Queued; delivery pending: {}", pending.join(", ")));
+    }
+    if !placeholders.is_empty() {
+        lines.push(format!(
+            "Note: launch placeholder name (session still binding; the message follows it to its real name): {}",
+            placeholders.join(", ")
+        ));
     }
     lines.join("\n")
 }

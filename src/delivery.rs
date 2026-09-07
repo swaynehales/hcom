@@ -1738,6 +1738,9 @@ enum Phase1Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifyTimeoutDecision {
     DeliveredWithoutCursor,
+    /// NRM-064: the recipient row is gone (placeholder retired mid-delivery).
+    /// "No pending rows" proves nothing here; do not claim success.
+    RecipientGone,
     Retry,
     FastFail,
     Reset,
@@ -1746,10 +1749,15 @@ enum VerifyTimeoutDecision {
 fn verify_timeout_decision(
     tool: Option<Tool>,
     has_pending: bool,
+    recipient_present: bool,
     inject_attempt: u32,
 ) -> VerifyTimeoutDecision {
     if !has_pending {
-        return VerifyTimeoutDecision::DeliveredWithoutCursor;
+        return if recipient_present {
+            VerifyTimeoutDecision::DeliveredWithoutCursor
+        } else {
+            VerifyTimeoutDecision::RecipientGone
+        };
     }
     if matches!(tool, Some(Tool::Claude)) {
         return VerifyTimeoutDecision::FastFail;
@@ -2758,9 +2766,15 @@ pub fn run_delivery_loop(
                     if elapsed > VERIFY_TIMEOUT {
                         inject_attempt += 1;
                         let has_pending = db.has_pending(&current_name);
+                        let recipient_present =
+                            matches!(db.get_instance_status(&current_name), Ok(Some(_)));
                         let parsed_tool = Tool::from_str(&config.tool).ok();
-                        let decision =
-                            verify_timeout_decision(parsed_tool, has_pending, inject_attempt);
+                        let decision = verify_timeout_decision(
+                            parsed_tool,
+                            has_pending,
+                            recipient_present,
+                            inject_attempt,
+                        );
                         log_warn(
                             "native",
                             "delivery.verify_timeout",
@@ -2782,6 +2796,20 @@ pub fn run_delivery_loop(
                                     "native",
                                     "delivery.success_no_cursor",
                                     "Messages gone despite cursor not advancing - delivery successful",
+                                );
+                                delivery_state = State::Idle;
+                                attempt = 0;
+                                inject_attempt = 0;
+                                continue;
+                            }
+                            VerifyTimeoutDecision::RecipientGone => {
+                                log_warn(
+                                    "native",
+                                    "delivery.recipient_gone",
+                                    &format!(
+                                        "No instance row for {} after inject; not a delivery (name may have changed, see binding_refresh)",
+                                        current_name
+                                    ),
                                 );
                                 delivery_state = State::Idle;
                                 attempt = 0;
@@ -3507,7 +3535,7 @@ mod tests {
     #[test]
     fn claude_fast_fails_after_first_unacknowledged_wake() {
         assert_eq!(
-            verify_timeout_decision(Some(Tool::Claude), true, 1),
+            verify_timeout_decision(Some(Tool::Claude), true, true, 1),
             VerifyTimeoutDecision::FastFail
         );
     }
@@ -3515,19 +3543,34 @@ mod tests {
     #[test]
     fn claude_accepts_consumed_queue_without_cursor_advance() {
         assert_eq!(
-            verify_timeout_decision(Some(Tool::Claude), false, 1),
+            verify_timeout_decision(Some(Tool::Claude), false, true, 1),
             VerifyTimeoutDecision::DeliveredWithoutCursor
         );
     }
 
     #[test]
+    fn vanished_recipient_is_not_a_delivery() {
+        for tool in [
+            Some(Tool::Claude),
+            Some(Tool::Antigravity),
+            Some(Tool::Codex),
+            None,
+        ] {
+            assert_eq!(
+                verify_timeout_decision(tool, false, false, 1),
+                VerifyTimeoutDecision::RecipientGone
+            );
+        }
+    }
+
+    #[test]
     fn non_claude_keeps_existing_verify_retry_contract() {
         assert_eq!(
-            verify_timeout_decision(Some(Tool::Codex), true, 1),
+            verify_timeout_decision(Some(Tool::Codex), true, true, 1),
             VerifyTimeoutDecision::Retry
         );
         assert_eq!(
-            verify_timeout_decision(Some(Tool::Codex), true, 3),
+            verify_timeout_decision(Some(Tool::Codex), true, true, 3),
             VerifyTimeoutDecision::Reset
         );
     }

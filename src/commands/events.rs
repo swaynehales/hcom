@@ -193,6 +193,13 @@ fn recipient_state(
         return format!("{name}: delivered {} via {via}", &ts[..ts.len().min(19)]);
     }
     let Ok(Some(row)) = db.get_instance_full(name) else {
+        // NRM-064: a retired placeholder's message follows the agent.
+        if let Some((new_id, to)) = db.readdressed_copy_of(message_id) {
+            return format!(
+                "{name}: re-addressed to {to} as #{new_id}; {}",
+                recipient_state(db, &to, new_id, message_ts_epoch)
+            );
+        }
         return format!("{name}: gone (no instance row; message can no longer be delivered)");
     };
     if row.last_event_id >= message_id {
@@ -1416,6 +1423,39 @@ mod tests {
             )
             .unwrap();
         db.conn().last_insert_rowid()
+    }
+
+    #[test]
+    fn message_state_follows_a_readdressed_placeholder_message() {
+        let (db, path) = state_test_db();
+        // haro was a resume placeholder; it is gone, buna is the real name.
+        state_instance(&db, "haro", 0, "pending", "new");
+        state_instance(&db, "buna", 0, "listening", "");
+        let original = state_message(&db, "luge", &["haro"]);
+        let moved = crate::instance_binding::readdress_placeholder_unread(&db, "haro", "buna");
+        assert_eq!(moved.len(), 1);
+        let copy = moved[0].1;
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'haro'", [])
+            .unwrap();
+
+        let text = message_state(&db, original).unwrap();
+        let line = text.lines().nth(1).unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "  haro: re-addressed to buna as #{copy}; buna: queued"
+            )),
+            "{line}"
+        );
+        // Once buna reads the copy, the original resolves as delivered through it.
+        assert_eq!(db.advance_cursor("buna", copy, "hook"), vec![copy]);
+        let text = message_state(&db, original).unwrap();
+        let line = text.lines().nth(1).unwrap();
+        assert!(
+            line.contains("buna: delivered ") && line.ends_with("via hook"),
+            "{line}"
+        );
+        state_cleanup(path);
     }
 
     #[test]

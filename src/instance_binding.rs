@@ -343,8 +343,90 @@ fn delete_true_placeholder_if_migrated(
         // Move pid/launch_context to the canonical row before dropping the placeholder
         // so the restored agent stays killable and its pane closeable.
         migrate_placeholder_runtime_state(db, canonical_name, placeholder_data);
+        // NRM-064: anything addressed to the placeholder while it was the only
+        // name a sender could see must follow the agent to its real name.
+        readdress_placeholder_unread(db, placeholder_name, canonical_name);
         delete_true_placeholder_instance(db, placeholder_name);
     }
+}
+
+/// NRM-064: re-address a retiring placeholder's unread messages to the
+/// canonical instance. Each becomes a new message event addressed to the
+/// canonical name alone, carrying `readdressed_from` (the original id) so
+/// `hcom events --msg <original>` can follow it. A `request` gets a fresh
+/// request watch on the new id and the placeholder's watch is dropped. The
+/// ledger is append-only: the original row is never edited.
+///
+/// Measured 2026-09-07: `#177257` to placeholder `haro` was lost when the
+/// session restored to `buna` one second later, and the delivery loop
+/// logged success because the placeholder row had vanished.
+pub(crate) fn readdress_placeholder_unread(
+    db: &HcomDb,
+    placeholder_name: &str,
+    canonical_name: &str,
+) -> Vec<(i64, i64)> {
+    let mut moved = Vec::new();
+    if placeholder_name == canonical_name {
+        return moved;
+    }
+    let Ok(Some(ph)) = db.get_instance_status(placeholder_name) else {
+        return moved;
+    };
+    let max_id = db.get_last_event_id();
+    for original_id in db.message_ids_for(placeholder_name, ph.last_event_id, max_id) {
+        let Some((routing_instance, mut data)) = db.get_event_row(original_id) else {
+            continue;
+        };
+        let from = data
+            .get("from")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if from == canonical_name {
+            continue;
+        }
+        let intent = data
+            .get("intent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        data["scope"] = serde_json::json!("mentions");
+        data["mentions"] = serde_json::json!([canonical_name]);
+        data["delivered_to"] = serde_json::json!([canonical_name]);
+        data["readdressed_from"] = serde_json::json!(original_id);
+        data["readdressed_reason"] = serde_json::json!(format!(
+            "placeholder {placeholder_name} retired for {canonical_name}"
+        ));
+        match db.log_event("message", &routing_instance, &data) {
+            Ok(new_id) => {
+                if intent.as_deref() == Some("request") && !from.is_empty() {
+                    let _ = db.kv_set(
+                        &format!("events_sub:reqwatch-{original_id}-{placeholder_name}"),
+                        None,
+                    );
+                    crate::db::subscriptions::create_request_watches(
+                        db,
+                        &from,
+                        new_id,
+                        &[canonical_name.to_string()],
+                    );
+                }
+                crate::log::log_info(
+                    "binding",
+                    "placeholder.readdressed",
+                    &format!(
+                        "#{original_id} to {placeholder_name} re-addressed to {canonical_name} as #{new_id}"
+                    ),
+                );
+                moved.push((original_id, new_id));
+            }
+            Err(e) => crate::log::log_error(
+                "binding",
+                "placeholder.readdress_failed",
+                &format!("#{original_id} to {placeholder_name}: {e}"),
+            ),
+        }
+    }
+    moved
 }
 
 /// Path 2: after restore_stopped bind, merge notify ports and drop the launch placeholder.
@@ -1567,6 +1649,100 @@ mod tests {
             db.get_process_binding("pid-oc").unwrap(),
             Some("fano".to_string())
         );
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_restore_stopped_readdresses_placeholder_unread_to_canonical() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        // buna stopped earlier with a known session; sender luge exists.
+        for (name, status) in [("buna", "inactive"), ("luge", "listening")] {
+            let mut d = serde_json::Map::new();
+            d.insert("name".into(), serde_json::json!(name));
+            d.insert("tool".into(), serde_json::json!("antigravity"));
+            d.insert("created_at".into(), serde_json::json!(now));
+            d.insert("status".into(), serde_json::json!(status));
+            db.save_instance_named(name, &d).unwrap();
+        }
+        db.log_life_event(
+            "buna",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({"session_id": "ses-agy-1", "tool": "antigravity"})),
+        )
+        .unwrap();
+
+        // Resume comes up as placeholder haro, cursor at the current max.
+        let mut haro = serde_json::Map::new();
+        haro.insert("name".into(), serde_json::json!("haro"));
+        haro.insert("tool".into(), serde_json::json!("antigravity"));
+        haro.insert("created_at".into(), serde_json::json!(now));
+        haro.insert("status".into(), serde_json::json!("pending"));
+        haro.insert("status_context".into(), serde_json::json!("new"));
+        haro.insert(
+            "last_event_id".into(),
+            serde_json::json!(db.get_last_event_id()),
+        );
+        db.save_instance_named("haro", &haro).unwrap();
+        db.set_process_binding("pid-agy", "", "haro").unwrap();
+
+        // A request lands on the placeholder during its window.
+        let original = db
+            .log_event(
+                "message",
+                "luge",
+                &serde_json::json!({
+                    "from": "luge", "sender_kind": "instance", "scope": "mentions",
+                    "text": "post-install check", "delivered_to": ["haro"],
+                    "intent": "request", "mentions": ["haro"],
+                }),
+            )
+            .unwrap();
+        crate::db::subscriptions::create_request_watches(
+            &db,
+            "luge",
+            original,
+            &["haro".to_string()],
+        );
+        assert!(db.has_pending("haro"));
+
+        let result = bind_session_to_process(&db, "ses-agy-1", Some("pid-agy"));
+        assert_eq!(result, Some("buna".to_string()));
+        assert!(db.get_instance_full("haro").unwrap().is_none());
+
+        // The message followed the agent.
+        let unread = db.get_unread_messages("buna");
+        assert_eq!(unread.len(), 1, "buna sees exactly the re-addressed copy");
+        assert_eq!(unread[0].text, "post-install check");
+        let copy_id = unread[0].event_id.unwrap();
+        assert!(copy_id > original);
+        let (_, copy) = db.get_event_row(copy_id).unwrap();
+        assert_eq!(copy["readdressed_from"].as_i64(), Some(original));
+        assert_eq!(copy["delivered_to"], serde_json::json!(["buna"]));
+        assert_eq!(copy["intent"], serde_json::json!("request"));
+
+        // The request watch moved with it.
+        assert!(
+            db.kv_get(&format!("events_sub:reqwatch-{original}-haro"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.kv_get(&format!("events_sub:reqwatch-{copy_id}-buna"))
+                .unwrap()
+                .is_some()
+        );
+
+        // Binding once more (a re-bind) does not duplicate anything.
+        let moved = readdress_placeholder_unread(&db, "haro", "buna");
+        assert!(moved.is_empty());
+        assert_eq!(db.get_unread_messages("buna").len(), 1);
 
         cleanup(path);
     }
