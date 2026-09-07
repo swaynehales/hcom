@@ -172,6 +172,35 @@ impl HcomDb {
     /// - event.id > instance.last_event_id
     /// - event.type = 'message'
     /// - instance is in scope (broadcast or direct)
+    /// One event's routing instance and parsed data, by id.
+    pub fn get_event_row(&self, event_id: i64) -> Option<(String, serde_json::Value)> {
+        let (instance, data): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT instance, data FROM events WHERE id = ?",
+                params![event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()?;
+        let json = serde_json::from_str(&data).ok()?;
+        Some((instance, json))
+    }
+
+    /// The message that re-addressed `original_id` to another recipient, if
+    /// any: `(new_id, recipient)`. NRM-064.
+    pub fn readdressed_copy_of(&self, original_id: i64) -> Option<(i64, String)> {
+        self.conn
+            .query_row(
+                "SELECT id, json_extract(data, '$.delivered_to[0]') FROM events
+                 WHERE type = 'message' AND id > ?1
+                   AND json_extract(data, '$.readdressed_from') = ?1
+                 ORDER BY id LIMIT 1",
+                params![original_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok()
+    }
+
     pub fn get_unread_messages(&self, name: &str) -> Vec<Message> {
         // Get last_event_id for this instance. A missing/unreadable row means there is
         // no recipient — return no unread rather than falling back to cursor 0, which
