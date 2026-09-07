@@ -15,7 +15,7 @@ use crate::identity::get_display_name;
 use crate::instance_lifecycle::{StatusUpdate, set_status};
 use crate::instances;
 use crate::notify::NotifyServer;
-use crate::shared::{CommandContext, ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
+use crate::shared::{CommandContext, ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 
 /// Parsed arguments for `hcom listen`.
 #[derive(clap::Parser, Debug)]
@@ -108,6 +108,25 @@ fn message_json(msg: &crate::db::Message) -> serde_json::Value {
         "thread": msg.thread,
         "id": msg.event_id,
     })
+}
+
+/// A listen timeout means "no message arrived", not "the agent went idle".
+/// If a turn started while this listen was in flight (the adapter's tool hooks
+/// set `active`, an approval prompt sets `blocked`), demoting the instance to
+/// `inactive exit:timeout` is a false idle signal — the fome flap of
+/// 2026-09-07, a keepalive listen whose timeout raced a fresh prompt and
+/// clobbered `active` (nurmterm NRM-065). Only an instance that is not
+/// currently working should be marked idle on timeout. Borrowed from dibs's
+/// liveness rule that a quiet signal is not evidence of death when another
+/// signal says working (`internal/liveness`).
+fn instance_is_working(db: &HcomDb, instance_name: &str) -> bool {
+    matches!(
+        db.get_instance_status(instance_name)
+            .ok()
+            .flatten()
+            .map(|s| s.status),
+        Some(ref st) if st == ST_ACTIVE || st == ST_BLOCKED
+    )
 }
 
 fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
@@ -414,7 +433,9 @@ fn listen_loop(
         // consume that budget under load even when a message is already queued.
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc")
+                && !instance_is_working(db, instance_name)
+            {
                 set_status(
                     db,
                     instance_name,
@@ -594,7 +615,9 @@ fn filter_listen_loop(
             if !json_output {
                 eprintln!("\n[Timeout: no match after {timeout}s]");
             }
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc")
+                && !instance_is_working(db, instance_name)
+            {
                 set_status(
                     db,
                     instance_name,
@@ -703,6 +726,47 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
+    /// NRM-065: a listen timeout must not demote an agent that a turn started
+    /// on while the listen was in flight.
+    #[test]
+    fn a_working_instance_is_not_demoted_on_listen_timeout() {
+        use crate::db::HcomDb;
+        let path = std::env::temp_dir().join(format!("test_nrm065_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = HcomDb::open_at(&path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, status, status_context) \
+                 VALUES ('solo', 'adhoc', 1000.0, 'listening', 'ready')",
+                [],
+            )
+            .unwrap();
+
+        // Idle: the timeout is free to mark it inactive.
+        assert!(!super::instance_is_working(&db, "solo"));
+
+        // A turn started during the listen — the timeout must leave it alone.
+        db.set_status("solo", crate::shared::ST_ACTIVE, "prompt")
+            .unwrap();
+        assert!(super::instance_is_working(&db, "solo"));
+
+        // An approval prompt is working too: blocked, not idle.
+        db.set_status("solo", crate::shared::ST_BLOCKED, "approval")
+            .unwrap();
+        assert!(super::instance_is_working(&db, "solo"));
+
+        // Back to listening, and the timeout may demote again.
+        db.set_status("solo", crate::shared::ST_LISTENING, "ready")
+            .unwrap();
+        assert!(!super::instance_is_working(&db, "solo"));
+
+        // An instance that is gone is not working.
+        assert!(!super::instance_is_working(&db, "nobody"));
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn listen_json_carries_intent_and_id() {
         let msg = crate::db::Message {
