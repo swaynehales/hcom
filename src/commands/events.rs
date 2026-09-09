@@ -979,6 +979,7 @@ fn events_wait(
 
     let start = Instant::now();
     let mut last_id = db.get_last_event_id();
+    let mut unread_preview_shown = false;
 
     let result = loop {
         if start.elapsed() >= Duration::from_secs(wait_timeout) {
@@ -1020,14 +1021,16 @@ fn events_wait(
             break 0;
         }
 
-        // Check for unread messages (interrupt wait) — use <hcom> XML tag format
-        if let Some(name) = instance_name {
+        // Check for unread messages (optional preview notification) — use <hcom> XML tag format
+        if let Some(name) = instance_name
+            && !unread_preview_shown
+        {
             let messages = db.get_unread_messages(name);
             if !messages.is_empty() {
                 // Format as <hcom> XML tag
                 let preview = build_message_preview(db, name);
                 println!("{preview}");
-                break 0;
+                unread_preview_shown = true;
             }
         }
 
