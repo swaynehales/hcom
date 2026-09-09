@@ -589,14 +589,25 @@ fn listen_with_filter(
     };
     let sub_key = format!("events_sub:{sub_id}");
 
-    // Mark as listening BEFORE capturing last_id
-    set_status(
-        db,
-        instance_name,
-        ST_LISTENING,
-        &format!("filter:{sub_id}"),
-        Default::default(),
-    );
+    // Mark as listening BEFORE capturing last_id. NRM-080: the keepalive
+    // restarts this listen every beat, so the write is skipped when the row
+    // already says `listening / filter`; the heartbeat is refreshed by
+    // `init_heartbeat` below regardless. The subscription id keeps its hash;
+    // the status context is stable so the row can be compared.
+    let current = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .map(|d| (d.status, d.status_context));
+    if listen_start_write_needed(current.as_ref().map(|(s, c)| (s.as_str(), c.as_str()))) {
+        set_status(
+            db,
+            instance_name,
+            ST_LISTENING,
+            FILTER_LISTEN_CONTEXT,
+            Default::default(),
+        );
+    }
 
     let sub_data = serde_json::json!({
         "id": sub_id,
