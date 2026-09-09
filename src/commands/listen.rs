@@ -163,6 +163,32 @@ fn instance_is_working(db: &HcomDb, instance_name: &str) -> bool {
 /// This is a function rather than an `if` at the call site so the decision can
 /// be tested. NRM-065's guard was tested only through `instance_is_working`,
 /// which is why it did not catch this site.
+/// What a listen that expired with no message writes, or `None` for nothing.
+///
+/// NRM-080: encodes the call-site decision at both timeout sites so it can be
+/// tested directly (the NRM-072 lesson). Current behaviour: an idle adhoc
+/// instance is demoted to `inactive exit:timeout`; everything else writes
+/// nothing.
+fn timeout_status(tool: &str, working: bool) -> Option<(&'static str, &'static str)> {
+    if tool == "adhoc" && !working {
+        Some((ST_INACTIVE, "exit:timeout"))
+    } else {
+        None
+    }
+}
+
+/// Whether a filtered listen's start must write `listening` at all.
+///
+/// NRM-080: the keepalive restarts a filtered listen every beat; a start write
+/// on a row that already says `listening / filter` is a duplicate event.
+fn listen_start_write_needed(current: Option<(&str, &str)>) -> bool {
+    !matches!(current, Some((ST_LISTENING, FILTER_LISTEN_CONTEXT)))
+}
+
+/// Stable status context for a filtered listen (the subscription id stays
+/// unique internally; the status row does not need to carry it).
+const FILTER_LISTEN_CONTEXT: &str = "filter";
+
 fn delivery_completion_status(tool: &str, working: bool) -> Option<(&'static str, &'static str)> {
     match tool {
         "adhoc" if working => None,
@@ -463,16 +489,11 @@ fn listen_loop(
         // consume that budget under load even when a message is already queued.
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc")
-                && !instance_is_working(db, instance_name)
+            let tool = instance_data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some((status, context)) =
+                timeout_status(tool, instance_is_working(db, instance_name))
             {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "exit:timeout",
-                    Default::default(),
-                );
+                set_status(db, instance_name, status, context, Default::default());
             }
             if !json_output {
                 eprintln!("\n[Timeout: no messages after {timeout}s]");
@@ -645,16 +666,11 @@ fn filter_listen_loop(
             if !json_output {
                 eprintln!("\n[Timeout: no match after {timeout}s]");
             }
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc")
-                && !instance_is_working(db, instance_name)
+            let tool = instance_data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some((status, context)) =
+                timeout_status(tool, instance_is_working(db, instance_name))
             {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "exit:timeout",
-                    Default::default(),
-                );
+                set_status(db, instance_name, status, context, Default::default());
             }
             return 0;
         }
@@ -787,6 +803,34 @@ mod tests {
             delivery_completion_status("claude", false),
             Some((ST_ACTIVE, "finished listening"))
         );
+    }
+
+    /// NRM-080: a listen timeout is "no message arrived", not "the agent is
+    /// gone". For an adhoc instance it must write nothing in either state:
+    /// the idle write was the keepalive flap (two junk rows per beat, 78 % of
+    /// the ledger on 2026-09-09) and the false `inactive` window in which
+    /// `send` refused an idle Droid. Tested at the decision the call sites
+    /// use, not through `instance_is_working`.
+    #[test]
+    fn listen_timeout_writes_nothing_for_adhoc() {
+        use super::timeout_status;
+        assert_eq!(timeout_status("adhoc", false), None);
+        assert_eq!(timeout_status("adhoc", true), None);
+        assert_eq!(timeout_status("claude", false), None);
+        assert_eq!(timeout_status("claude", true), None);
+    }
+
+    /// NRM-080: the keepalive's filtered listen restarts every beat; a start
+    /// on a row already `listening / filter` must not write a second event.
+    #[test]
+    fn filtered_listen_start_is_idempotent() {
+        use super::{listen_start_write_needed, FILTER_LISTEN_CONTEXT};
+        use crate::shared::{ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
+        assert!(!listen_start_write_needed(Some((ST_LISTENING, FILTER_LISTEN_CONTEXT))));
+        assert!(listen_start_write_needed(Some((ST_LISTENING, "ready"))));
+        assert!(listen_start_write_needed(Some((ST_INACTIVE, "exit:timeout"))));
+        assert!(listen_start_write_needed(Some((ST_ACTIVE, "prompt"))));
+        assert!(listen_start_write_needed(None));
     }
 
     /// NRM-065: a listen timeout must not demote an agent that a turn started
