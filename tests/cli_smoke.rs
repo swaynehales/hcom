@@ -202,6 +202,80 @@ fn send_to_missing_agent_lists_available() {
 }
 
 #[test]
+fn send_json_reports_event_and_fork_delivery_feedback() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let queued = h.start();
+    let paused = h.start();
+    let conn = rusqlite::Connection::open(h.path().join("hcom.db")).expect("open hcom db");
+    conn.execute(
+        "UPDATE instances
+         SET status = 'listening', status_context = '', tcp_mode = 1
+         WHERE name = ?1",
+        [&queued],
+    )
+    .expect("prepare queued recipient");
+    conn.execute(
+        "UPDATE instances
+         SET status = 'listening', status_context = 'tui:not-ready', tcp_mode = 1
+         WHERE name = ?1",
+        [&paused],
+    )
+    .expect("prepare paused recipient");
+
+    let (human_code, human_stdout, human_stderr) = h.run([
+        "send",
+        &format!("@{queued}"),
+        &format!("@{paused}"),
+        "--name",
+        &sender,
+        "--",
+        "human probe",
+    ]);
+    assert_eq!(human_code, 0, "stdout={human_stdout} stderr={human_stderr}");
+    let event_id = human_stdout
+        .lines()
+        .next()
+        .and_then(|line| line.rsplit_once("  #"))
+        .map(|(_, id)| id)
+        .expect("human feedback carries event id");
+    assert_eq!(
+        human_stdout,
+        format!(
+            "Queued; delivery paused: ◉ {paused}  #{event_id}\n\
+             Queued; delivery pending: ◉ {queued}\n\
+             State: hcom events --msg {event_id}\n"
+        )
+    );
+
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        &format!("@{queued}"),
+        &format!("@{paused}"),
+        "--name",
+        &sender,
+        "--",
+        "probe",
+    ]);
+
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let output: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("send json: {e}\n{stdout}"));
+    assert!(output["event_id"].as_i64().is_some(), "output={output}");
+    assert_eq!(output["delivered_to"], serde_json::json!([queued, paused]));
+    assert_eq!(output["queued"], serde_json::json!([queued]));
+    assert_eq!(
+        output["paused"],
+        serde_json::json!([{
+            "name": paused,
+            "reason": "tui:not-ready",
+        }])
+    );
+    assert_eq!(output.as_object().map(serde_json::Map::len), Some(4));
+}
+
+#[test]
 fn send_strips_redundant_trailing_name_from_auto_resolved_sender() {
     let h = Hcom::new();
     let recipient = h.start();
