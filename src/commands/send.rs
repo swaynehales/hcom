@@ -111,6 +111,10 @@ pub struct SendArgs {
     #[arg(long)]
     pub quiet: bool,
 
+    /// Print result as a single-line JSON object
+    #[arg(long)]
+    pub json: bool,
+
     // ── Inline bundle ──
     /// Bundle title (creates inline bundle)
     #[arg(long)]
@@ -226,24 +230,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
         return format!("Sent to: {SENDER}");
     }
 
-    // `send_message` wakes PTY delivery loops over one-way TCP. Give a local
-    // loop a short, shared deadline to publish its first gate disposition (or
-    // consume the message) before describing the result. The deadline is
-    // collective, so fan-out cannot multiply CLI latency.
-    let deadline = Instant::now() + RECIPIENT_FEEDBACK_SYNC_TIMEOUT;
-    let sync_candidates = recipient_feedback_sync_candidates(db, delivered_to);
-    while recipient_feedback_needs_delivery_sync(db, &sync_candidates) {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::sleep(RECIPIENT_FEEDBACK_POLL_INTERVAL.min(deadline - now));
-    }
-    let unresolved: HashSet<&str> = sync_candidates
-        .iter()
-        .filter(|name| db.has_pending(name))
-        .map(String::as_str)
-        .collect();
+    let unresolved = unresolved_feedback_recipients(db, delivered_to);
 
     let mut healthy = Vec::new();
     let mut paused = Vec::new();
@@ -261,7 +248,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
             }
             if is_delivery_paused_status_context(&data.status_context) {
                 paused.push(recipient);
-            } else if unresolved.contains(name.as_str()) {
+            } else if unresolved.contains(name) {
                 pending.push(recipient);
             } else {
                 healthy.push(recipient);
@@ -290,6 +277,55 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn unresolved_feedback_recipients(db: &HcomDb, delivered_to: &[String]) -> HashSet<String> {
+    // `send_message` wakes PTY delivery loops over one-way TCP. Give a local
+    // loop a short, shared deadline to publish its first gate disposition (or
+    // consume the message) before describing the result. The deadline is
+    // collective, so fan-out cannot multiply CLI latency.
+    let deadline = Instant::now() + RECIPIENT_FEEDBACK_SYNC_TIMEOUT;
+    let sync_candidates = recipient_feedback_sync_candidates(db, delivered_to);
+    while recipient_feedback_needs_delivery_sync(db, &sync_candidates) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(RECIPIENT_FEEDBACK_POLL_INTERVAL.min(deadline - now));
+    }
+    let unresolved: HashSet<&str> = sync_candidates
+        .iter()
+        .filter(|name| db.has_pending(name))
+        .map(String::as_str)
+        .collect();
+    unresolved.into_iter().map(str::to_string).collect()
+}
+
+fn json_send_feedback(db: &HcomDb, event_id: i64, delivered_to: &[String]) -> serde_json::Value {
+    let unresolved = unresolved_feedback_recipients(db, delivered_to);
+    let mut queued = Vec::new();
+    let mut paused = Vec::new();
+
+    for name in delivered_to {
+        let Ok(Some(data)) = db.get_instance_full(name) else {
+            continue;
+        };
+        if is_delivery_paused_status_context(&data.status_context) {
+            paused.push(serde_json::json!({
+                "name": name,
+                "reason": data.status_context,
+            }));
+        } else if unresolved.contains(name) {
+            queued.push(name);
+        }
+    }
+
+    serde_json::json!({
+        "event_id": event_id,
+        "delivered_to": delivered_to,
+        "queued": queued,
+        "paused": paused,
+    })
 }
 
 /// Append the message id to the first feedback line, and a resolution hint
@@ -1139,6 +1175,12 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     };
 
     // ── Feedback ──
+    if args.json {
+        println!("{}", json_send_feedback(db, message_id, &delivered_to));
+        crate::relay::worker::ensure_worker(true);
+        return 0;
+    }
+
     if args.quiet {
         crate::relay::worker::ensure_worker(true);
         return 0;
