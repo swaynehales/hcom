@@ -145,6 +145,32 @@ fn instance_is_working(db: &HcomDb, instance_name: &str) -> bool {
     }
 }
 
+/// What an unfiltered listen writes after it hands its messages to the caller,
+/// or `None` when it must write nothing at all.
+///
+/// The `None` case is the whole point (NRM-072). For an adhoc instance the
+/// delivery write used to be unconditional `inactive / message received`, which
+/// is the same false-idle bug as NRM-065 one branch over: a turn that started
+/// while the listen was in flight has already written `active`, and this write
+/// lands on top of it, so a working agent reads as dead. Reproduced 2026-09-09
+/// on a disposable ledger — `active tool:Bash`, message arrives during the
+/// listen, row becomes `inactive message received`. The filtered path never had
+/// it; its equivalent writes `active / filter matched`.
+///
+/// Non-adhoc instances keep `active / finished listening`: they have a turn
+/// lifecycle of their own and the caller is about to act on the message.
+///
+/// This is a function rather than an `if` at the call site so the decision can
+/// be tested. NRM-065's guard was tested only through `instance_is_working`,
+/// which is why it did not catch this site.
+fn delivery_completion_status(tool: &str, working: bool) -> Option<(&'static str, &'static str)> {
+    match tool {
+        "adhoc" if working => None,
+        "adhoc" => Some((ST_INACTIVE, "message received")),
+        _ => Some((ST_ACTIVE, "finished listening")),
+    }
+}
+
 fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
     let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
     let prefix = match (intent, thread) {
@@ -412,22 +438,10 @@ fn listen_loop(
                 .get("tool")
                 .and_then(|v| v.as_str())
                 .unwrap_or("claude");
-            if tool == "adhoc" {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "message received",
-                    Default::default(),
-                );
-            } else {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_ACTIVE,
-                    "finished listening",
-                    Default::default(),
-                );
+            if let Some((status, context)) =
+                delivery_completion_status(tool, instance_is_working(db, instance_name))
+            {
+                set_status(db, instance_name, status, context, Default::default());
             }
 
             if json_output {
@@ -742,6 +756,39 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
+    /// NRM-072: the delivery write at the end of an unfiltered listen must not
+    /// demote a working agent either. This tests the call site's decision, not
+    /// just `instance_is_working` — NRM-065 tested only the latter, which is
+    /// why this site kept the bug for two days.
+    #[test]
+    fn delivery_write_does_not_demote_a_working_adhoc_instance() {
+        use super::delivery_completion_status;
+        use crate::shared::{ST_ACTIVE, ST_INACTIVE};
+
+        // The defect: an adhoc agent whose turn started mid-listen. Reproduced
+        // on a disposable ledger before the fix — `active tool:Bash` became
+        // `inactive message received` when a message arrived.
+        assert_eq!(delivery_completion_status("adhoc", true), None);
+
+        // An adhoc agent that really is idle still gets the idle write; the
+        // fix must not cost the signal it was there to provide.
+        assert_eq!(
+            delivery_completion_status("adhoc", false),
+            Some((ST_INACTIVE, "message received"))
+        );
+
+        // Non-adhoc is unchanged in both states — it has its own turn
+        // lifecycle and the caller is about to act on the message.
+        assert_eq!(
+            delivery_completion_status("claude", true),
+            Some((ST_ACTIVE, "finished listening"))
+        );
+        assert_eq!(
+            delivery_completion_status("claude", false),
+            Some((ST_ACTIVE, "finished listening"))
+        );
+    }
+
     /// NRM-065: a listen timeout must not demote an agent that a turn started
     /// on while the listen was in flight.
     #[test]
