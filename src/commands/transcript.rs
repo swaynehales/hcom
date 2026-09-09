@@ -1376,13 +1376,32 @@ fn resolve_instance_transcript(
         return Some((name, path, tool, sid));
     }
 
-    // Prefix match
-    if let Ok((matched_name, path, tool, sid)) = db.conn().query_row(
-        "SELECT name, transcript_path, tool, session_id FROM instances WHERE name LIKE ? AND transcript_path IS NOT NULL AND transcript_path != '' LIMIT 1",
-        rusqlite::params![format!("{}%", name)],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)),
+    // Prefix match (literal matching; only an unambiguous single match returns immediately)
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name, transcript_path, tool, session_id FROM instances WHERE name LIKE ?1 ESCAPE '\\' AND transcript_path IS NOT NULL AND transcript_path != '' LIMIT 2",
     ) {
-        return Some((matched_name, path, tool, sid));
+        let rows_res = stmt
+            .query_map(rusqlite::params![pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .and_then(|mapped| mapped.collect::<rusqlite::Result<Vec<_>>>());
+
+        if let Ok(matches) = rows_res
+            && matches.len() == 1
+        {
+            return Some(matches.into_iter().next().unwrap());
+        }
     }
 
     // Check stopped events (session_id from snapshot)
