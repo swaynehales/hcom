@@ -47,6 +47,25 @@ const OSC_TITLE_0: &[u8] = b"\x1b]0;";
 const OSC_TITLE_2: &[u8] = b"\x1b]2;";
 const CODEX_ACTION_REQUIRED: &str = "Action Required";
 
+/// Codex idle-input placeholders whose dim style can be lost by some terminals.
+const CODEX_PLACEHOLDERS: &[&str] = &[
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Implement {feature}",
+    "Find and fix a bug in @filename",
+    "Write tests for @filename",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Use /skills to list available skills",
+    "Check recently modified functions for compatibility",
+    "How many files have been modified?",
+    "Will this algorithm scale well?",
+];
+
+fn is_codex_placeholder(text: &str) -> bool {
+    CODEX_PLACEHOLDERS.contains(&text)
+}
+
 /// Antigravity's accept-edits banner, rendered on the prompt row in normal
 /// intensity — visually identical to a user draft (`Antigravity 1.1.17`).
 const ANTIGRAVITY_ACCEPT_EDITS_BANNER: &str =
@@ -902,6 +921,10 @@ impl ScreenTracker {
                     return Some(String::new());
                 }
 
+                if is_codex_placeholder(text) {
+                    return Some(String::new());
+                }
+
                 // Dim text = placeholder, not real input
                 match self.is_dim_after_prompt(row_idx as u16, "›") {
                     Some(true) => return Some(String::new()),
@@ -1598,6 +1621,17 @@ mod tests {
     fn codex_no_prompt_no_ready() {
         let t = make_tracker(24, 80, "? for shortcuts");
         assert_eq!(t.get_codex_input_text(), None);
+    }
+
+    #[test]
+    fn codex_known_placeholder_without_dim_returns_empty() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+
+        // Some terminals lose the placeholder's dim style.
+        t.process("› Improve documentation in @filename\r\n? for shortcuts\r\n".as_bytes());
+
+        assert_eq!(t.get_codex_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("codex"));
     }
 
     #[test]
