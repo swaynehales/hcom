@@ -189,6 +189,109 @@ fn send_without_identity_errors_with_hint() {
 }
 
 #[test]
+fn send_json_delivered_excludes_queued_and_paused_recipients() {
+    // NRM-076: `delivered_to` is the addressed set, so a paused or queued
+    // recipient appears in it. `delivered` must carry only the recipients that
+    // reached a live delivery path, and the three states must not overlap.
+    let h = Hcom::new();
+    let sender = h.start();
+    let healthy = h.start();
+    let queued = h.start();
+    let paused = h.start();
+    let conn = rusqlite::Connection::open(h.path().join("hcom.db")).expect("open hcom db");
+    conn.execute(
+        "UPDATE instances
+         SET status = 'listening', status_context = '', tcp_mode = 0
+         WHERE name = ?1",
+        [&healthy],
+    )
+    .expect("prepare healthy recipient");
+    conn.execute(
+        "UPDATE instances
+         SET status = 'listening', status_context = '', tcp_mode = 1
+         WHERE name = ?1",
+        [&queued],
+    )
+    .expect("prepare queued recipient");
+    conn.execute(
+        "UPDATE instances
+         SET status = 'listening', status_context = 'tui:prompt-has-text', tcp_mode = 1
+         WHERE name = ?1",
+        [&paused],
+    )
+    .expect("prepare paused recipient");
+
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        &format!("@{healthy}"),
+        &format!("@{queued}"),
+        &format!("@{paused}"),
+        "--name",
+        &sender,
+        "--",
+        "probe",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let output: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("send json: {e}\n{stdout}"));
+
+    assert_eq!(
+        output["delivered_to"],
+        serde_json::json!([healthy, queued, paused]),
+        "delivered_to stays the addressed set: output={output}"
+    );
+    assert_eq!(
+        output["delivered"],
+        serde_json::json!([healthy]),
+        "only the live recipient is delivered: output={output}"
+    );
+    assert_eq!(
+        output["queued"],
+        serde_json::json!([queued]),
+        "output={output}"
+    );
+    assert_eq!(
+        output["paused"],
+        serde_json::json!([{ "name": paused, "reason": "tui:prompt-has-text" }]),
+        "output={output}"
+    );
+
+    // Disjointness, and each a subset of the addressed set.
+    let names = |key: &str| -> Vec<String> {
+        output[key]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v["name"].as_str().expect("name").to_string())
+            })
+            .collect()
+    };
+    let addressed = names("delivered_to");
+    let (d, q, p) = (names("delivered"), names("queued"), names("paused"));
+    for bucket in [&d, &q, &p] {
+        for name in bucket {
+            assert!(
+                addressed.contains(name),
+                "{name} is not in delivered_to: output={output}"
+            );
+        }
+    }
+    for name in &d {
+        assert!(
+            !q.contains(name) && !p.contains(name),
+            "{name} in two states"
+        );
+    }
+    for name in &q {
+        assert!(!p.contains(name), "{name} in two states");
+    }
+}
+
+#[test]
 fn send_to_missing_agent_lists_available() {
     let h = Hcom::new();
     let me = h.start();
@@ -272,7 +375,12 @@ fn send_json_reports_event_and_fork_delivery_feedback() {
             "reason": "tui:not-ready",
         }])
     );
-    assert_eq!(output.as_object().map(serde_json::Map::len), Some(4));
+    assert_eq!(
+        output["delivered"],
+        serde_json::json!([]),
+        "neither recipient reached a live delivery path: output={output}"
+    );
+    assert_eq!(output.as_object().map(serde_json::Map::len), Some(5));
 }
 
 #[test]

@@ -301,8 +301,24 @@ fn unresolved_feedback_recipients(db: &HcomDb, delivered_to: &[String]) -> HashS
     unresolved.into_iter().map(str::to_string).collect()
 }
 
+/// Machine-readable send result.
+///
+/// NRM-076: `delivered_to` is the stored *addressed* set — hcom writes it onto
+/// the message record before delivery is attempted, and reads it back as the
+/// read-receipt denominator (`messages.rs`) and the recipient count in message
+/// prefixes (`cli_context.rs`). It therefore cannot be narrowed to mean
+/// "delivered" without changing those readers. Instead this emits `delivered`
+/// alongside it, carrying only the recipients that reached a live delivery
+/// path — the same bucket the human feedback calls healthy, and the only field
+/// a script should trust for delivery.
+///
+/// `delivered`, `queued` and `paused` are disjoint and are each a subset of
+/// `delivered_to`. They do not necessarily cover it: an addressed recipient
+/// whose instance row has disappeared between send and feedback appears in
+/// none of the three, exactly as it is dropped from the human feedback.
 fn json_send_feedback(db: &HcomDb, event_id: i64, delivered_to: &[String]) -> serde_json::Value {
     let unresolved = unresolved_feedback_recipients(db, delivered_to);
+    let mut delivered = Vec::new();
     let mut queued = Vec::new();
     let mut paused = Vec::new();
 
@@ -317,12 +333,15 @@ fn json_send_feedback(db: &HcomDb, event_id: i64, delivered_to: &[String]) -> se
             }));
         } else if unresolved.contains(name) {
             queued.push(name);
+        } else {
+            delivered.push(name);
         }
     }
 
     serde_json::json!({
         "event_id": event_id,
         "delivered_to": delivered_to,
+        "delivered": delivered,
         "queued": queued,
         "paused": paused,
     })
