@@ -3159,7 +3159,7 @@ mod tests {
     fn plugin_wake_ack_marks_paused_after_window_and_clears_on_drain() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         db.conn()
             .execute(
