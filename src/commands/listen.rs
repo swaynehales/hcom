@@ -166,15 +166,18 @@ fn instance_is_working(db: &HcomDb, instance_name: &str) -> bool {
 /// What a listen that expired with no message writes, or `None` for nothing.
 ///
 /// NRM-080: encodes the call-site decision at both timeout sites so it can be
-/// tested directly (the NRM-072 lesson). Current behaviour: an idle adhoc
-/// instance is demoted to `inactive exit:timeout`; everything else writes
-/// nothing.
-fn timeout_status(tool: &str, working: bool) -> Option<(&'static str, &'static str)> {
-    if tool == "adhoc" && !working {
-        Some((ST_INACTIVE, "exit:timeout"))
-    } else {
-        None
-    }
+/// tested directly (the NRM-072 lesson). It is `None` for every tool. Before
+/// 2026-09-09 an idle adhoc instance was demoted to `inactive exit:timeout`
+/// here; that write was the Droid keepalive flap — two junk status rows per
+/// beat, 78 % of the ledger — and, between the write and the next listen's
+/// start, a false `inactive` window in which `send` refused an idle Droid
+/// (nurmterm NRM-080, `@gani` → `@veri` 2026-09-09 18:14). A timeout carries
+/// no liveness information: `instances.last_stop` is refreshed by
+/// `init_heartbeat`/`update_heartbeat` independently of any status write, and
+/// `get_instance_status` computes staleness from it. Non-adhoc tools never
+/// wrote here. The function stays so the decision remains a tested seam.
+fn timeout_status(_tool: &str) -> Option<(&'static str, &'static str)> {
+    None
 }
 
 /// Whether a filtered listen's start must write `listening` at all.
@@ -490,9 +493,7 @@ fn listen_loop(
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
             let tool = instance_data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some((status, context)) =
-                timeout_status(tool, instance_is_working(db, instance_name))
-            {
+            if let Some((status, context)) = timeout_status(tool) {
                 set_status(db, instance_name, status, context, Default::default());
             }
             if !json_output {
@@ -667,9 +668,7 @@ fn filter_listen_loop(
                 eprintln!("\n[Timeout: no match after {timeout}s]");
             }
             let tool = instance_data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some((status, context)) =
-                timeout_status(tool, instance_is_working(db, instance_name))
-            {
+            if let Some((status, context)) = timeout_status(tool) {
                 set_status(db, instance_name, status, context, Default::default());
             }
             return 0;
@@ -814,10 +813,9 @@ mod tests {
     #[test]
     fn listen_timeout_writes_nothing_for_adhoc() {
         use super::timeout_status;
-        assert_eq!(timeout_status("adhoc", false), None);
-        assert_eq!(timeout_status("adhoc", true), None);
-        assert_eq!(timeout_status("claude", false), None);
-        assert_eq!(timeout_status("claude", true), None);
+        assert_eq!(timeout_status("adhoc"), None);
+        assert_eq!(timeout_status("claude"), None);
+        assert_eq!(timeout_status(""), None);
     }
 
     /// NRM-080: the keepalive's filtered listen restarts every beat; a start
