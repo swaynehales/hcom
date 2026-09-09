@@ -172,6 +172,7 @@ impl HcomDb {
     /// - event.id > instance.last_event_id
     /// - event.type = 'message'
     /// - instance is in scope (broadcast or direct)
+    ///
     /// One event's routing instance and parsed data, by id.
     pub fn get_event_row(&self, event_id: i64) -> Option<(String, serde_json::Value)> {
         let (instance, data): (String, String) = self
