@@ -521,7 +521,10 @@ fn listen_loop(
         // consume that budget under load even when a message is already queued.
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
-            let tool = instance_data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            let tool = instance_data
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some((status, context)) = timeout_status(tool) {
                 set_status(db, instance_name, status, context, Default::default());
             }
@@ -707,7 +710,10 @@ fn filter_listen_loop(
             if !json_output {
                 eprintln!("\n[Timeout: no match after {timeout}s]");
             }
-            let tool = instance_data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            let tool = instance_data
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some((status, context)) = timeout_status(tool) {
                 set_status(db, instance_name, status, context, Default::default());
             }
@@ -901,11 +907,17 @@ mod tests {
     /// on a row already `listening / filter` must not write a second event.
     #[test]
     fn filtered_listen_start_is_idempotent() {
-        use super::{listen_start_write_needed, FILTER_LISTEN_CONTEXT};
+        use super::{FILTER_LISTEN_CONTEXT, listen_start_write_needed};
         use crate::shared::{ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
-        assert!(!listen_start_write_needed(Some((ST_LISTENING, FILTER_LISTEN_CONTEXT))));
+        assert!(!listen_start_write_needed(Some((
+            ST_LISTENING,
+            FILTER_LISTEN_CONTEXT
+        ))));
         assert!(listen_start_write_needed(Some((ST_LISTENING, "ready"))));
-        assert!(listen_start_write_needed(Some((ST_INACTIVE, "exit:timeout"))));
+        assert!(listen_start_write_needed(Some((
+            ST_INACTIVE,
+            "exit:timeout"
+        ))));
         assert!(listen_start_write_needed(Some((ST_ACTIVE, "prompt"))));
         assert!(listen_start_write_needed(None));
     }
