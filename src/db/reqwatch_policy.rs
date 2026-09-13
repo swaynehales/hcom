@@ -7,6 +7,19 @@ use serde_json::Value;
 /// Per idle spell only — reset when the target goes `active`/`blocked` again.
 pub(crate) const AGY_REQWATCH_IDLE_GRACE_SEC: f64 = 10.0;
 
+/// Grace for an adhoc `listening` edge that reports a *spool receipt*, not a
+/// turn end (`listening / spooled`, NRM-083 G5).
+///
+/// The spool edge means the keepalive's filtered listener queued the message
+/// and the model has not been woken yet, so "idle without reply" must wait out
+/// the wake path itself: the Droid doorbell's ring cooldown (180 s,
+/// `ring_cooldown`, `adapters/droid/hcom-droid-keepalive.sh:100`) plus one
+/// keepalive beat (25 s, `:45`) plus a margin. Both knobs are env-overridable
+/// in the adapter; coupling hcom to their shipped values is accepted here and
+/// exercised by the acceptance tests. Every other adhoc edge keeps
+/// [`AGY_REQWATCH_IDLE_GRACE_SEC`].
+pub(crate) const ADHOC_SPOOL_GRACE_SEC: f64 = 240.0;
+
 /// Whether a stored Antigravity idle grace is ready for timer/sweep handling.
 pub(crate) fn idle_grace_expired(sub: &Value, now: f64) -> bool {
     sub.get("idle_grace_until")
@@ -15,10 +28,17 @@ pub(crate) fn idle_grace_expired(sub: &Value, now: f64) -> bool {
 }
 
 /// How a request-watch subscription should react to a matching event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ReqwatchNotifyDecision {
-    /// Defer caller notification; caller should bump `last_id` and maybe set grace.
-    Defer { set_grace_if_absent: bool },
+    /// Defer caller notification; caller should bump `last_id` and maybe set
+    /// grace. Carries the grace length and the kind that fired, so the
+    /// caller can store `idle_grace_kind` (the expiry notice keys on it,
+    /// NRM-083 G5 R2).
+    Defer {
+        set_grace_if_absent: bool,
+        grace_sec: f64,
+        grace_kind: &'static str,
+    },
     /// Proceed to notify the request watcher.
     Proceed,
     /// Ignore this event for reqwatch (agy non-listening/non-stopped).
@@ -48,6 +68,21 @@ pub(crate) fn reqwatch_notify_decision(
         event_type == "life" && data.get("action").and_then(|v| v.as_str()) == Some("stopped");
 
     if is_listening {
+        // NRM-083 G5: a `listening` edge with context `spooled` (or an edge
+        // whose previous context was `spooled` — a watch created between the
+        // message write and the watch insert misses the spool edge but sees
+        // the `filter` edge that follows it) reports a spool receipt, not a
+        // turn end. It gets the spool grace, not the idle grace.
+        let spooled = matches!(data.get("context").and_then(|v| v.as_str()), Some("spooled"))
+            || matches!(
+                data.get("old_context").and_then(|v| v.as_str()),
+                Some("spooled")
+            );
+        let (grace_sec, grace_kind) = if spooled {
+            (ADHOC_SPOOL_GRACE_SEC, "spooled")
+        } else {
+            (AGY_REQWATCH_IDLE_GRACE_SEC, "default")
+        };
         let grace_until = sub.get("idle_grace_until").and_then(|v| v.as_f64());
         let defer = match grace_until {
             None => true,
@@ -57,6 +92,8 @@ pub(crate) fn reqwatch_notify_decision(
         if defer {
             return ReqwatchNotifyDecision::Defer {
                 set_grace_if_absent: grace_until.is_none(),
+                grace_sec,
+                grace_kind,
             };
         }
         return ReqwatchNotifyDecision::Proceed;
@@ -91,7 +128,9 @@ mod tests {
         assert_eq!(
             reqwatch_notify_decision("adhoc", "status", &data, &sub, 100.0),
             ReqwatchNotifyDecision::Defer {
-                set_grace_if_absent: true
+                set_grace_if_absent: true,
+                grace_sec: AGY_REQWATCH_IDLE_GRACE_SEC,
+                grace_kind: "default",
             }
         );
     }
@@ -103,8 +142,67 @@ mod tests {
         assert_eq!(
             reqwatch_notify_decision("antigravity", "status", &data, &sub, 100.0),
             ReqwatchNotifyDecision::Defer {
-                set_grace_if_absent: true
+                set_grace_if_absent: true,
+                grace_sec: AGY_REQWATCH_IDLE_GRACE_SEC,
+                grace_kind: "default",
             }
+        );
+    }
+
+    // NRM-083 G5 R1: a spooled edge (or an edge whose previous context was
+    // spooled) defers with the spool grace, not the idle grace.
+    #[test]
+    fn test_adhoc_spooled_edge_gets_spool_grace() {
+        let sub = json!({});
+        let data = json!({"status": "listening", "context": "spooled"});
+        assert_eq!(
+            reqwatch_notify_decision("adhoc", "status", &data, &sub, 100.0),
+            ReqwatchNotifyDecision::Defer {
+                set_grace_if_absent: true,
+                grace_sec: ADHOC_SPOOL_GRACE_SEC,
+                grace_kind: "spooled",
+            }
+        );
+    }
+
+    #[test]
+    fn test_adhoc_old_context_spooled_edge_gets_spool_grace() {
+        let sub = json!({});
+        let data = json!({"status": "listening", "old_context": "spooled"});
+        assert_eq!(
+            reqwatch_notify_decision("adhoc", "status", &data, &sub, 100.0),
+            ReqwatchNotifyDecision::Defer {
+                set_grace_if_absent: true,
+                grace_sec: ADHOC_SPOOL_GRACE_SEC,
+                grace_kind: "spooled",
+            }
+        );
+    }
+
+    #[test]
+    fn test_adhoc_ready_and_filter_edges_keep_idle_grace() {
+        let sub = json!({});
+        for context in ["ready", "filter"] {
+            let data = json!({"status": "listening", "context": context});
+            assert_eq!(
+                reqwatch_notify_decision("adhoc", "status", &data, &sub, 100.0),
+                ReqwatchNotifyDecision::Defer {
+                    set_grace_if_absent: true,
+                    grace_sec: AGY_REQWATCH_IDLE_GRACE_SEC,
+                    grace_kind: "default",
+                },
+                "context {context} must keep the idle grace"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_adhoc_spooled_edge_proceeds_immediately() {
+        let sub = json!({});
+        let data = json!({"status": "listening", "context": "spooled"});
+        assert_eq!(
+            reqwatch_notify_decision("gemini", "status", &data, &sub, 0.0),
+            ReqwatchNotifyDecision::Proceed
         );
     }
 

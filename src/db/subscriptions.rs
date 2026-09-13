@@ -179,7 +179,6 @@ pub(crate) fn build_and_insert_sql_subscription(
     })
 }
 
-pub(crate) use super::reqwatch_policy::AGY_REQWATCH_IDLE_GRACE_SEC;
 
 fn instance_tool(db: &HcomDb, name: &str) -> String {
     db.conn()
@@ -283,16 +282,55 @@ fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
         if let Some(obj) = sub_mut.as_object_mut() {
             obj.remove("idle_grace_until");
             obj.remove("idle_grace_event_id");
+            obj.remove("idle_grace_kind");
+            obj.remove("idle_grace_started");
             kv_store_sub(db, &key, &sub_mut);
         }
     }
 }
 
+/// Notice for a request watch whose *spool* grace expired (NRM-083 G5 R2).
+///
+/// A `listening / spooled` edge means the keepalive queued the message and no
+/// turn ever started, so "went idle without responding" would be false — the
+/// model has not seen the request. The sender needs to know that a resend
+/// will not help and the operator is the escalation path. `queued_at_epoch`
+/// is when the spool grace was armed (the spool edge, within milliseconds of
+/// the delivery).
+fn format_spool_grace_notice(
+    db: &HcomDb,
+    sub_id: &str,
+    event_id: i64,
+    filters: &serde_json::Value,
+    queued_at_epoch: f64,
+    now: f64,
+) -> String {
+    let request_id = filters
+        .get("request_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let target = filters
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let since = if request_id > 0 {
+        db.delivery_record_for(target, request_id)
+            .map(|(_, ts, _)| ts[..ts.len().min(19)].to_string())
+            .unwrap_or_else(|| "?".to_string())
+    } else {
+        "?".to_string()
+    };
+    let elapsed = (now - queued_at_epoch).max(0.0) as u64;
+    format!(
+        "[sub:{}] #{} {} has not picked up your request #{}: queued since {}, no turn started in {}s",
+        sub_id, event_id, target, request_id, since, elapsed
+    )
+}
+
 /// Fire Antigravity request watches whose idle grace elapsed while no matching
 /// event arrived. The conditional delete is the claim: concurrent sweepers can
 /// observe the same row, but only one can remove it and emit the one-shot notice.
-fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
-    for (key, sub, filters) in load_reqwatch_subs(db) {
+fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {    for (key, sub, filters) in load_reqwatch_subs(db) {
         if !reqwatch_grace_tool(filters.get("target_tool").and_then(|v| v.as_str()))
             || !super::reqwatch_policy::idle_grace_expired(&sub, now)
         {
@@ -363,15 +401,31 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or(key.as_str());
-        let notification = format_sub_notification(
-            db,
-            sub_id,
-            candidate_event_id,
-            "status",
-            target,
-            &serde_json::json!({"status": "listening"}),
-            Some(&filters),
-        );
+        // A spooled grace that expired uncleaned means the message was queued
+        // and no turn ever started (NRM-083 G5 R2): the notice says that,
+        // not "went idle".
+        let notification = match (
+            sub.get("idle_grace_kind").and_then(|v| v.as_str()),
+            sub.get("idle_grace_started").and_then(|v| v.as_f64()),
+        ) {
+            (Some("spooled"), Some(started)) => format_spool_grace_notice(
+                db,
+                sub_id,
+                candidate_event_id,
+                &filters,
+                started,
+                now,
+            ),
+            _ => format_sub_notification(
+                db,
+                sub_id,
+                candidate_event_id,
+                "status",
+                target,
+                &serde_json::json!({"status": "listening"}),
+                Some(&filters),
+            ),
+        };
         let _ = send_sub_notification(db, caller, &notification);
     }
 }
@@ -716,13 +770,20 @@ pub(crate) fn process_logged_event(
                     super::reqwatch_policy::ReqwatchNotifyDecision::Skip => continue,
                     super::reqwatch_policy::ReqwatchNotifyDecision::Defer {
                         set_grace_if_absent,
+                        grace_sec,
+                        grace_kind,
                     } => {
                         let mut sub_mut = sub.clone();
                         sub_mut["last_id"] = serde_json::json!(event_id);
                         if set_grace_if_absent {
                             sub_mut["idle_grace_until"] =
-                                serde_json::json!(now + AGY_REQWATCH_IDLE_GRACE_SEC);
+                                serde_json::json!(now + grace_sec);
                             sub_mut["idle_grace_event_id"] = serde_json::json!(event_id);
+                            sub_mut["idle_grace_kind"] = serde_json::json!(grace_kind);
+                            // Anchor for the spool-grace notice's "no turn
+                            // started in Ns" (NRM-083 G5 R2). The spool edge
+                            // is written within milliseconds of the delivery.
+                            sub_mut["idle_grace_started"] = serde_json::json!(now);
                         }
                         kv_store_sub(db, key, &sub_mut);
                         continue;
@@ -746,15 +807,44 @@ pub(crate) fn process_logged_event(
         }
 
         let filters_opt = sub.get("filters");
-        let notification = format_sub_notification(
-            db,
-            sub_id,
-            event_id,
-            event_type,
-            instance,
-            data,
-            filters_opt,
+        // Same rule as the sweep (NRM-083 G5 R2): when the grace that expired
+        // was a spool grace, the notice reports an unpicked-up request, not
+        // "went idle". The kind is cleared after firing so a later edge
+        // re-arms fresh instead of repeating the stale notice.
+        let spool_fire = (
+            sub.get("idle_grace_kind").and_then(|v| v.as_str()) == Some("spooled"),
+            sub.get("idle_grace_started").and_then(|v| v.as_f64()),
         );
+        let fire_now = crate::shared::time::now_epoch_f64();
+        let notification = match spool_fire {
+            (true, Some(started)) if filters_opt.is_some() => format_spool_grace_notice(
+                db,
+                sub_id,
+                event_id,
+                filters_opt.unwrap_or(&sub),
+                started,
+                fire_now,
+            ),
+            _ => format_sub_notification(
+                db,
+                sub_id,
+                event_id,
+                event_type,
+                instance,
+                data,
+                filters_opt,
+            ),
+        };
+        if spool_fire.0 {
+            let mut sub_mut = sub.clone();
+            if let Some(obj) = sub_mut.as_object_mut() {
+                obj.remove("idle_grace_until");
+                obj.remove("idle_grace_event_id");
+                obj.remove("idle_grace_kind");
+                obj.remove("idle_grace_started");
+                kv_store_sub(db, key, &sub_mut);
+            }
+        }
         let _ = send_sub_notification(db, caller, &notification);
 
         if let Some(on_hit_text) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
