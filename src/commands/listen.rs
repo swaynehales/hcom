@@ -200,6 +200,35 @@ fn delivery_completion_status(tool: &str, working: bool) -> Option<(&'static str
     }
 }
 
+/// What a filtered listen writes when it receives a message (NRM-083 G5).
+///
+/// For an adhoc instance the listener process is the keepalive's spooler, not
+/// the model: the old `active / message received` read as the agent picking
+/// the message up and fed "picked up and ignored" false alarms to request
+/// watchers (demu→nebo, events 264776/264777). The row now reports the queue
+/// state — `listening / spooled` — which request watchers key their spool
+/// grace on (`ADHOC_SPOOL_GRACE_SEC`) and humans can tell apart from a turn
+/// end. Contexts are contract values; see the gate review.
+///
+/// A filtered listen already in flight when a turn starts still receives
+/// messages mid-turn (observed: `#267312`, `#268638`, written between
+/// `tool:send` and `active / turn`), so the working guard is the same as
+/// `delivery_completion_status`'s: adhoc and working writes nothing rather
+/// than demote or falsely idle a working Droid. The residual — a mid-turn
+/// receive starting from NRM-081's `inactive / tool:*` row, which
+/// `instance_is_working` does not count as working — is recorded under
+/// NRM-081.
+///
+/// Non-adhoc keeps `active / message received`: the caller is about to act on
+/// the message, so `active` is true information.
+fn filter_receive_status(tool: &str, working: bool) -> Option<(&'static str, &'static str)> {
+    match tool {
+        "adhoc" if working => None,
+        "adhoc" => Some((ST_LISTENING, "spooled")),
+        _ => Some((ST_ACTIVE, "message received")),
+    }
+}
+
 fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
     let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
     let prefix = match (intent, thread) {
@@ -745,13 +774,18 @@ fn filter_listen_loop(
                     let formatted = format_messages_json(db, &owned, instance_name);
                     println!("\n{formatted}");
                 }
-                set_status(
-                    db,
-                    instance_name,
-                    ST_ACTIVE,
-                    "message received",
-                    Default::default(),
-                );
+                // NRM-083 G5: the receive write goes through the seam so an
+                // adhoc keepalive receipt reports the queue, not agent
+                // activity, and a mid-turn receipt writes nothing at all.
+                let tool = instance_data
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some((status, context)) =
+                    filter_receive_status(tool, instance_is_working(db, instance_name))
+                {
+                    set_status(db, instance_name, status, context, Default::default());
+                }
                 return 0;
             }
         }
@@ -827,6 +861,40 @@ mod tests {
         assert_eq!(timeout_status("adhoc"), None);
         assert_eq!(timeout_status("claude"), None);
         assert_eq!(timeout_status(""), None);
+    }
+
+    /// NRM-083 G5: a filtered listen's receive write must report the queue,
+    /// not the agent. The old `active / message received` was written by the
+    /// keepalive's listener process and read as "picked up and ignored"
+    /// (demu→nebo, events 264776/264777); request watchers key their spool
+    /// grace on the new `listening / spooled` edge. Tested at the seam, with
+    /// the NRM-072 working guard mirrored: a filtered listen in flight when a
+    /// turn starts (`#267312`, `#268638`) must not write over a working
+    /// Droid.
+    #[test]
+    fn filtered_receive_reports_queue_state_for_adhoc() {
+        use super::filter_receive_status;
+        use crate::shared::{ST_ACTIVE, ST_LISTENING};
+
+        // Idle keepalive receipt: queue state, honestly labeled.
+        assert_eq!(
+            filter_receive_status("adhoc", false),
+            Some((ST_LISTENING, "spooled"))
+        );
+
+        // Mid-turn receipt: nothing — the same guard as
+        // `delivery_completion_status`.
+        assert_eq!(filter_receive_status("adhoc", true), None);
+
+        // Non-adhoc is unchanged: the caller is about to act on the message.
+        assert_eq!(
+            filter_receive_status("claude", false),
+            Some((ST_ACTIVE, "message received"))
+        );
+        assert_eq!(
+            filter_receive_status("claude", true),
+            Some((ST_ACTIVE, "message received"))
+        );
     }
 
     /// NRM-080: the keepalive's filtered listen restarts every beat; a start
