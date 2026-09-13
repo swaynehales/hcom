@@ -72,12 +72,17 @@ pub(crate) fn reqwatch_notify_decision(
         // whose previous context was `spooled` — a watch created between the
         // message write and the watch insert misses the spool edge but sees
         // the `filter` edge that follows it) reports a spool receipt, not a
-        // turn end. It gets the spool grace, not the idle grace.
-        let spooled = matches!(data.get("context").and_then(|v| v.as_str()), Some("spooled"))
-            || matches!(
+        // turn end. It gets the spool grace, not the idle grace. Adhoc only:
+        // `spooled` is a Droid-adapter contract value (gate 2 advisory); agy
+        // never writes it and keeps the idle grace on any edge.
+        let spooled = target_tool == "adhoc"
+            && (matches!(
+                data.get("context").and_then(|v| v.as_str()),
+                Some("spooled")
+            ) || matches!(
                 data.get("old_context").and_then(|v| v.as_str()),
                 Some("spooled")
-            );
+            ));
         let (grace_sec, grace_kind) = if spooled {
             (ADHOC_SPOOL_GRACE_SEC, "spooled")
         } else {
