@@ -179,7 +179,6 @@ pub(crate) fn build_and_insert_sql_subscription(
     })
 }
 
-
 fn instance_tool(db: &HcomDb, name: &str) -> String {
     db.conn()
         .query_row(
@@ -309,10 +308,7 @@ fn format_spool_grace_notice(
         .get("request_id")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let target = filters
-        .get("target")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let target = filters.get("target").and_then(|v| v.as_str()).unwrap_or("");
     let since = if request_id > 0 {
         db.delivery_record_for(target, request_id)
             .map(|(_, ts, _)| ts[..ts.len().min(19)].to_string())
@@ -330,7 +326,8 @@ fn format_spool_grace_notice(
 /// Fire Antigravity request watches whose idle grace elapsed while no matching
 /// event arrived. The conditional delete is the claim: concurrent sweepers can
 /// observe the same row, but only one can remove it and emit the one-shot notice.
-fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {    for (key, sub, filters) in load_reqwatch_subs(db) {
+fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
+    for (key, sub, filters) in load_reqwatch_subs(db) {
         if !reqwatch_grace_tool(filters.get("target_tool").and_then(|v| v.as_str()))
             || !super::reqwatch_policy::idle_grace_expired(&sub, now)
         {
@@ -408,14 +405,9 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {    for (key, sub, filt
             sub.get("idle_grace_kind").and_then(|v| v.as_str()),
             sub.get("idle_grace_started").and_then(|v| v.as_f64()),
         ) {
-            (Some("spooled"), Some(started)) => format_spool_grace_notice(
-                db,
-                sub_id,
-                candidate_event_id,
-                &filters,
-                started,
-                now,
-            ),
+            (Some("spooled"), Some(started)) => {
+                format_spool_grace_notice(db, sub_id, candidate_event_id, &filters, started, now)
+            }
             _ => format_sub_notification(
                 db,
                 sub_id,
@@ -776,8 +768,7 @@ pub(crate) fn process_logged_event(
                         let mut sub_mut = sub.clone();
                         sub_mut["last_id"] = serde_json::json!(event_id);
                         if set_grace_if_absent {
-                            sub_mut["idle_grace_until"] =
-                                serde_json::json!(now + grace_sec);
+                            sub_mut["idle_grace_until"] = serde_json::json!(now + grace_sec);
                             sub_mut["idle_grace_event_id"] = serde_json::json!(event_id);
                             sub_mut["idle_grace_kind"] = serde_json::json!(grace_kind);
                             // Anchor for the spool-grace notice's "no turn
@@ -807,17 +798,24 @@ pub(crate) fn process_logged_event(
         }
 
         let filters_opt = sub.get("filters");
-        // Same rule as the sweep (NRM-083 G5 R2): when the grace that expired
-        // was a spool grace, the notice reports an unpicked-up request, not
-        // "went idle". The kind is cleared after firing so a later edge
-        // re-arms fresh instead of repeating the stale notice.
-        let spool_fire = (
-            sub.get("idle_grace_kind").and_then(|v| v.as_str()) == Some("spooled"),
-            sub.get("idle_grace_started").and_then(|v| v.as_f64()),
-        );
+        // Same rule as the sweep (NRM-083 G5 R2), restricted to status events
+        // (gate 2, G2-1): a `life/stopped` event proceeds through the policy
+        // too, and a Droid that dies with the request still queued must send
+        // the stopped notice — the fact that decides the sender's next move
+        // (relaunch, not wait) — not "has not picked up". The kind is armed
+        // for adhoc only; the tool check re-asserts that at the fire site.
         let fire_now = crate::shared::time::now_epoch_f64();
-        let notification = match spool_fire {
-            (true, Some(started)) if filters_opt.is_some() => format_spool_grace_notice(
+        let spool_target = filters_opt
+            .and_then(|f| f.get("target_tool"))
+            .and_then(|v| v.as_str());
+        let spool_fire = event_type == "status"
+            && spool_target == Some("adhoc")
+            && sub.get("idle_grace_kind").and_then(|v| v.as_str()) == Some("spooled");
+        let notification = match (
+            spool_fire,
+            sub.get("idle_grace_started").and_then(|v| v.as_f64()),
+        ) {
+            (true, Some(started)) => format_spool_grace_notice(
                 db,
                 sub_id,
                 event_id,
@@ -835,16 +833,6 @@ pub(crate) fn process_logged_event(
                 filters_opt,
             ),
         };
-        if spool_fire.0 {
-            let mut sub_mut = sub.clone();
-            if let Some(obj) = sub_mut.as_object_mut() {
-                obj.remove("idle_grace_until");
-                obj.remove("idle_grace_event_id");
-                obj.remove("idle_grace_kind");
-                obj.remove("idle_grace_started");
-                kv_store_sub(db, key, &sub_mut);
-            }
-        }
         let _ = send_sub_notification(db, caller, &notification);
 
         if let Some(on_hit_text) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
@@ -1270,6 +1258,7 @@ fn sha256_hash(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::reqwatch_policy::{ADHOC_SPOOL_GRACE_SEC, AGY_REQWATCH_IDLE_GRACE_SEC};
     use rusqlite::params;
     use std::io::ErrorKind;
     use std::net::TcpListener;
@@ -1647,6 +1636,239 @@ mod tests {
             count_reqwatch_without_reply_notifications(&db, "gora"),
             before + 1,
             "a listening edge on a listening row still notifies"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    // ---- NRM-083 G5: the spool grace and its notice ----
+
+    fn reqwatch_sub_value(db: &HcomDb, request_id: i64, responder: &str) -> serde_json::Value {
+        let key = format!("events_sub:reqwatch-{request_id}-{responder}");
+        serde_json::from_str(&db.kv_get(&key).unwrap().unwrap()).unwrap()
+    }
+
+    fn reqwatch_sub_exists(db: &HcomDb, request_id: i64, responder: &str) -> bool {
+        db.kv_get(&format!("events_sub:reqwatch-{request_id}-{responder}"))
+            .unwrap()
+            .is_some()
+    }
+
+    fn last_notice_text(db: &HcomDb, pattern: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') LIKE ?1 ORDER BY id DESC LIMIT 1",
+                params![pattern],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// (a) A spooled edge arms the 240 s spool grace and stores its kind and
+    /// start anchor.
+    #[test]
+    fn test_reqwatch_spooled_edge_arms_spool_grace() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "vito", "adhoc");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "spooled"}),
+        )
+        .unwrap();
+        let sub = reqwatch_sub_value(&db, request_id, "vito");
+        assert_eq!(sub["idle_grace_kind"], "spooled");
+        let until = sub["idle_grace_until"].as_f64().unwrap();
+        let started = sub["idle_grace_started"].as_f64().unwrap();
+        assert!(
+            (until - started - ADHOC_SPOOL_GRACE_SEC).abs() < 5.0,
+            "spool grace must be ADHOC_SPOOL_GRACE_SEC over the spool edge"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    /// (b) The `filter` edge that follows the spool edge on the next beat
+    /// must not re-arm or relabel the grace (set_grace_if_absent).
+    #[test]
+    fn test_reqwatch_filter_edge_after_spool_does_not_rearm() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "vito", "adhoc");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "spooled"}),
+        )
+        .unwrap();
+        let before = reqwatch_sub_value(&db, request_id, "vito");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "filter", "old_context": "spooled"}),
+        )
+        .unwrap();
+        let after = reqwatch_sub_value(&db, request_id, "vito");
+        assert_eq!(after["idle_grace_kind"], "spooled");
+        assert_eq!(after["idle_grace_until"], before["idle_grace_until"]);
+        assert_eq!(after["idle_grace_started"], before["idle_grace_started"]);
+        cleanup_test_db(db_path);
+    }
+
+    /// (c) The sweep after a spool-grace expiry sends the "has not picked up"
+    /// notice and consumes the watch.
+    #[test]
+    fn test_reqwatch_spool_grace_sweep_sends_not_picked_up_notice() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "vito", "adhoc");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "spooled"}),
+        )
+        .unwrap();
+        let started = reqwatch_sub_value(&db, request_id, "vito")["idle_grace_started"]
+            .as_f64()
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening' WHERE name = 'vito'",
+                [],
+            )
+            .unwrap();
+        sweep_expired_reqwatch_graces(&db, started + ADHOC_SPOOL_GRACE_SEC + 1.0);
+        let text = last_notice_text(&db, "%has not picked up your request%")
+            .expect("expired spool grace must fire the not-picked-up notice");
+        assert!(
+            text.contains(&format!(
+                "vito has not picked up your request #{request_id}"
+            )),
+            "notice names target and request: {text}"
+        );
+        assert!(
+            text.contains("queued since "),
+            "notice names the queue time: {text}"
+        );
+        assert!(
+            !reqwatch_sub_exists(&db, request_id, "vito"),
+            "the sweep's claim consumes the watch"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    /// (d) An `active` event clears the whole grace; a later `ready` edge
+    /// re-arms at 10 s and fires the OLD text — a turn-end idle is a real
+    /// non-response, not a queue state.
+    #[test]
+    fn test_reqwatch_active_clears_spool_grace_and_ready_rearms_idle() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "vito", "adhoc");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "spooled"}),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "active", "context": "tool:Execute"}),
+        )
+        .unwrap();
+        let cleared = reqwatch_sub_value(&db, request_id, "vito");
+        assert!(cleared.get("idle_grace_until").is_none());
+        assert!(cleared.get("idle_grace_kind").is_none());
+        assert!(cleared.get("idle_grace_started").is_none());
+        assert!(cleared.get("idle_grace_event_id").is_none());
+
+        // The row must read idle for the ready edge to be evaluated at all
+        // (the busy guard re-arms past edges of a working target).
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening' WHERE name = 'vito'",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "ready"}),
+        )
+        .unwrap();
+        let rearmed = reqwatch_sub_value(&db, request_id, "vito");
+        assert_eq!(rearmed["idle_grace_kind"], "default");
+        let until = rearmed["idle_grace_until"].as_f64().unwrap();
+        let started = rearmed["idle_grace_started"].as_f64().unwrap();
+        assert!((until - started - AGY_REQWATCH_IDLE_GRACE_SEC).abs() < 5.0);
+
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening' WHERE name = 'vito'",
+                [],
+            )
+            .unwrap();
+        sweep_expired_reqwatch_graces(&db, f64::MAX);
+        let text = last_notice_text(&db, "%without responding to your request%")
+            .expect("turn-end idle must fire the old notice");
+        assert!(
+            !text.contains("has not picked up"),
+            "old text, not spool text: {text}"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    /// (e) A legacy sub armed before the upgrade has `idle_grace_until` but no
+    /// kind: it fires the old text (fails safe — an alarm, not silence).
+    #[test]
+    fn test_reqwatch_legacy_kindless_sub_keeps_old_notice() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "vito", "adhoc");
+        let key = format!("events_sub:reqwatch-{request_id}-vito");
+        let mut sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&key).unwrap().unwrap()).unwrap();
+        sub["idle_grace_until"] = serde_json::json!(1.0);
+        db.kv_set(&key, Some(&sub.to_string())).unwrap();
+
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening' WHERE name = 'vito'",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "filter"}),
+        )
+        .unwrap();
+        let text = last_notice_text(&db, "%without responding to your request%")
+            .expect("legacy sub must still notify");
+        assert!(
+            !text.contains("has not picked up"),
+            "kind-less sub keeps the old text: {text}"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    /// (f) Gate 2 G2-1: a Droid that STOPS with the request still queued must
+    /// send the stopped notice — the fact that decides the sender's next
+    /// move — never "has not picked up".
+    #[test]
+    fn test_reqwatch_stopped_with_request_queued_sends_stopped_notice() {
+        let (db, db_path) = setup_full_test_db();
+        let _request_id = setup_reqwatch_pair(&db, "gora", "vito", "adhoc");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "spooled"}),
+        )
+        .unwrap();
+        db.log_event("life", "vito", &serde_json::json!({"action": "stopped"}))
+            .unwrap();
+        let text = last_notice_text(&db, "%without responding to your request%")
+            .expect("a stopped target must notify");
+        assert!(text.contains("stopped"), "stopped notice: {text}");
+        assert!(
+            !text.contains("has not picked up"),
+            "a stopped event keeps the stopped notice: {text}"
         );
         cleanup_test_db(db_path);
     }
