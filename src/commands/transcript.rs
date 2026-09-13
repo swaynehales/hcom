@@ -1264,26 +1264,9 @@ pub fn render_remote_instance_transcript_with_options_no_retry(
     name: &str,
     display_name: &str,
     device: &str,
-    range: Option<&str>,
-    last_n: usize,
-    json_mode: bool,
-    full_mode: bool,
-    detailed: bool,
+    opts: &TranscriptRenderOpts<'_>,
 ) -> Result<String, String> {
-    render_instance_transcript_impl(
-        db,
-        name,
-        &TranscriptRenderOpts {
-            range,
-            last_n,
-            json_mode,
-            full_mode,
-            detailed,
-            retry_codex: false,
-        },
-        display_name,
-        Some(device),
-    )
+    render_instance_transcript_impl(db, name, opts, display_name, Some(device))
 }
 
 pub fn render_instance_transcript_with_options(

@@ -995,11 +995,14 @@ fn handle_remote_transcript(
                 target,
                 display_target,
                 device,
-                range,
-                last_n,
-                json_mode,
-                full_mode,
-                detailed,
+                &crate::commands::transcript::TranscriptRenderOpts {
+                    range,
+                    last_n,
+                    json_mode,
+                    full_mode,
+                    detailed,
+                    retry_codex: false,
+                },
             )?
         }
         None => crate::commands::transcript::render_instance_transcript_with_options_no_retry(
