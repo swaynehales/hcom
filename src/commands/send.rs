@@ -428,7 +428,8 @@ fn resolve_delivery(
     explicit_targets: Option<&[String]>,
 ) -> Result<ResolvedDelivery, String> {
     // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
-    // Adhoc instances use inactive:tool:* between commands — still @mentionable.
+    // Adhoc instances stay @mentionable whatever their status row shows —
+    // since NRM-081 they no longer write inactive:tool:* per command.
     let rows = deliverable_instances(db)?;
 
     // Compute scope and routing. Thread-only sends keep their original message

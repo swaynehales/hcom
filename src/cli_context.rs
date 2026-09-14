@@ -126,7 +126,7 @@ pub fn check_identity_gate(
 /// - Codex: has notify hook (turn-end) but no pre-tool hook
 ///
 /// Status model:
-/// - Adhoc: nothing (NRM-081 — see `hookless_command_write`)
+/// - Adhoc: liveness touch only, no event (NRM-081 — see `hookless_command_write`)
 /// - Others: active:tool:* (hooks will reset to idle when turn ends)
 pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandContext) {
     if STATUS_SKIP_COMMANDS.contains(&cmd_name) {
@@ -156,35 +156,60 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
 
-    let Some((status, context)) = hookless_command_write(tool, has_parent, cmd_name) else {
-        return;
-    };
-    lifecycle::set_status(db, &identity.name, status, &context, Default::default());
+    match hookless_command_write(tool, has_parent, cmd_name) {
+        HooklessCommandWrite::None => {}
+        HooklessCommandWrite::Touch => {
+            // Gate R1: a bare adhoc identity — hooks-less, no keepalive listen
+            // — has no other writer to push its reap age out; the removed
+            // status row used to be its only freshness bump, and the 1 h
+            // stale tier would reap it mid-use. Refresh the freshness fields
+            // in place, event-free (same mechanism as the listen-exit clear).
+            // Both fields: a listening row ages by last_stop (heartbeat), a
+            // non-listening row by status_time — an actively sending adhoc is
+            // alive under either accounting.
+            let now = crate::shared::time::now_epoch_i64();
+            let mut updates = serde_json::Map::new();
+            updates.insert("status_time".into(), serde_json::json!(now));
+            updates.insert("last_stop".into(), serde_json::json!(now));
+            crate::instances::update_instance_position(db, &identity.name, &updates);
+        }
+        HooklessCommandWrite::Status(status, context) => {
+            lifecycle::set_status(db, &identity.name, status, &context, Default::default());
+        }
+    }
 }
 
-/// NRM-081 decision seam: the status row a hookless command runner should
-/// write, if any. NRM-072/080 style — pure function, unit-tested here.
+/// What a hookless command runner should write, if anything. NRM-081 decision
+/// seam, NRM-072/080 style — pure function, unit-tested here.
 ///
-/// - Not hookless (claude/gemini with PreToolUse hooks): None — the hooks own
-///   the status row.
-/// - Adhoc: None. Adhoc identities run hcom commands constantly (send, list,
-///   events, listen); an `inactive tool:<cmd>` row per command is display
-///   noise that reads as a dead instance, and mentionability (commands/send.rs
-///   treats adhoc senders as mentionable) does not depend on the row. The
-///   listen-timeout path (`commands/listen.rs`) remains the only writer of an
-///   adhoc `inactive` row, via the real `exit:timeout` transition.
-/// - Codex / subagent: `Some((ST_ACTIVE, "tool:<cmd>"))` — no pre-tool hook
+/// - Not hookless (claude/gemini with PreToolUse hooks): `None` — the hooks
+///   own the status row.
+/// - Adhoc: `Touch`. Adhoc identities run hcom commands constantly (send,
+///   list, events, listen); an `inactive tool:<cmd>` row per command was
+///   display noise that read as a dead instance, and mentionability
+///   (commands/send.rs treats adhoc senders as mentionable) does not depend
+///   on the row. The remaining adhoc `inactive` writer is
+///   `delivery_completion_status` (`commands/listen.rs` — the real
+///   `inactive / message received` delivery edge); the listen timeout itself
+///   writes nothing since NRM-080.
+/// - Codex / subagent: `Status(ST_ACTIVE, "tool:<cmd>")` — no pre-tool hook
 ///   would otherwise show the command running.
-fn hookless_command_write(
-    tool: &str,
-    has_parent: bool,
-    cmd_name: &str,
-) -> Option<(&'static str, String)> {
+#[derive(Debug, PartialEq)]
+enum HooklessCommandWrite {
+    None,
+    Touch,
+    Status(&'static str, String),
+}
+
+fn hookless_command_write(tool: &str, has_parent: bool, cmd_name: &str) -> HooklessCommandWrite {
     let is_hookless = has_parent || tool == "codex" || tool == "adhoc";
-    if !is_hookless || tool == "adhoc" {
-        return None;
+    if !is_hookless {
+        return HooklessCommandWrite::None;
     }
-    Some((ST_ACTIVE, format!("tool:{cmd_name}")))
+    if tool == "adhoc" {
+        return HooklessCommandWrite::Touch;
+    }
+    HooklessCommandWrite::Status(ST_ACTIVE, format!("tool:{cmd_name}"))
 }
 
 /// For hookless instances (codex/adhoc): append unread messages after command output.
@@ -573,30 +598,95 @@ mod tests {
     use crate::shared::ST_ACTIVE;
 
     #[test]
-    fn adhoc_command_write_is_suppressed() {
+    fn adhoc_command_write_is_a_liveness_touch_only() {
         // NRM-081: an inactive tool:<cmd> row per hcom command reads as dead.
-        assert!(hookless_command_write("adhoc", false, "send").is_none());
-        assert!(hookless_command_write("adhoc", false, "list").is_none());
-        assert!(hookless_command_write("adhoc", false, "events").is_none());
+        assert_eq!(
+            hookless_command_write("adhoc", false, "send"),
+            HooklessCommandWrite::Touch
+        );
+        assert_eq!(
+            hookless_command_write("adhoc", false, "list"),
+            HooklessCommandWrite::Touch
+        );
+        assert_eq!(
+            hookless_command_write("adhoc", false, "events"),
+            HooklessCommandWrite::Touch
+        );
     }
 
     #[test]
     fn codex_and_subagent_keep_their_active_command_row() {
-        let (status, context) = hookless_command_write("codex", false, "send").unwrap();
-        assert_eq!(status, ST_ACTIVE);
-        assert_eq!(context, "tool:send");
+        assert_eq!(
+            hookless_command_write("codex", false, "send"),
+            HooklessCommandWrite::Status(ST_ACTIVE, "tool:send".into())
+        );
 
         // Subagent: no pre-tool hook of its own, tool may be anything.
-        let (status, context) = hookless_command_write("claude", true, "send").unwrap();
-        assert_eq!(status, ST_ACTIVE);
-        assert_eq!(context, "tool:send");
+        assert_eq!(
+            hookless_command_write("claude", true, "send"),
+            HooklessCommandWrite::Status(ST_ACTIVE, "tool:send".into())
+        );
     }
 
     #[test]
     fn hooked_instances_write_nothing_at_the_command_seam() {
-        assert!(hookless_command_write("claude", false, "send").is_none());
-        assert!(hookless_command_write("gemini", false, "list").is_none());
-        assert!(hookless_command_write("", false, "send").is_none());
+        assert_eq!(
+            hookless_command_write("claude", false, "send"),
+            HooklessCommandWrite::None
+        );
+        assert_eq!(
+            hookless_command_write("gemini", false, "list"),
+            HooklessCommandWrite::None
+        );
+        assert_eq!(
+            hookless_command_write("", false, "send"),
+            HooklessCommandWrite::None
+        );
+    }
+
+    /// Gate R1: the touch must advance the freshness fields (status_time and
+    /// last_stop — a listening row ages by last_stop, a non-listening row by
+    /// status_time) while leaving status and context exactly as they were,
+    /// and emit no event.
+    #[test]
+    fn adhoc_command_touches_freshness_without_a_status_row() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", "adhoc");
+        let stale = chrono::Utc::now().timestamp() - 3700;
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening', status_context = 'ready', \
+                 status_time = ?1, last_stop = ?1 WHERE name = 'luna'",
+                rusqlite::params![stale],
+            )
+            .unwrap();
+        let events_before: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+
+        let ctx = CommandContext {
+            explicit_name: None,
+            identity: Some(SenderIdentity {
+                kind: SenderKind::Instance,
+                name: "luna".into(),
+                instance_data: Some(serde_json::json!({"tool": "adhoc"})),
+                session_id: None,
+            }),
+            go: false,
+        };
+        set_hookless_command_status(&db, "send", &ctx);
+
+        let data = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(data.status, "listening"); // unchanged
+        assert_eq!(data.status_context, "ready"); // unchanged
+        assert!(data.status_time > stale); // advanced
+        assert!(data.last_stop > stale); // advanced
+        let events_after: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events_after, events_before); // no event
     }
 
     #[test]
