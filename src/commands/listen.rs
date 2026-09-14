@@ -229,6 +229,16 @@ fn filter_receive_status(tool: &str, working: bool) -> Option<(&'static str, &'s
     }
 }
 
+/// NRM-081 seam: is the post-listen `cmd:listen` cleanup a real transition?
+/// A quiet listen run leaves the row already at listening/ready, so the
+/// rewrite would be display noise — only the transient detail needs clearing,
+/// in place and without an event. A row that left listening/ready mid-listen
+/// (e.g. a filter match wrote `active / filter matched`) still needs the
+/// restore write.
+fn listen_exit_row_unchanged(status: &str, context: &str) -> bool {
+    status == ST_LISTENING && context == "ready"
+}
+
 fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
     let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
     let prefix = match (intent, thread) {
@@ -432,17 +442,25 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         &shutdown,
     );
 
-    // Cleanup: clear cmd:listen detail if still set
+    // Cleanup: clear cmd:listen detail if still set. When the row already
+    // reads listening/ready, the rewrite is display noise (NRM-081 ~22/h) —
+    // clear the transient detail in place instead of emitting a status event.
     if let Ok(Some(current)) = db.get_instance_full(&instance_name)
         && current.status_detail == "cmd:listen"
     {
-        set_status(
-            db,
-            &instance_name,
-            ST_LISTENING,
-            "ready",
-            Default::default(),
-        );
+        if listen_exit_row_unchanged(&current.status, &current.status_context) {
+            let mut updates = serde_json::Map::new();
+            updates.insert("status_detail".into(), serde_json::json!(""));
+            instances::update_instance_position(db, &instance_name, &updates);
+        } else {
+            set_status(
+                db,
+                &instance_name,
+                ST_LISTENING,
+                "ready",
+                Default::default(),
+            );
+        }
     }
 
     // Cleanup notify endpoint
@@ -867,6 +885,26 @@ mod tests {
         assert_eq!(timeout_status("adhoc"), None);
         assert_eq!(timeout_status("claude"), None);
         assert_eq!(timeout_status(""), None);
+    }
+
+    /// NRM-081: the exit cleanup must not rewrite a row that already reads
+    /// listening/ready — a quiet listen run emits the same status+context it
+    /// started with, so the rewrite is ~22/h of display noise. The row still
+    /// left listening/ready mid-listen (filter match, receive) needs the
+    /// restore write.
+    #[test]
+    fn listen_exit_cleanup_writes_only_on_a_real_transition() {
+        use super::listen_exit_row_unchanged;
+        use crate::shared::{ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
+
+        // Quiet run: started listening/ready, nothing moved it — no rewrite.
+        assert!(listen_exit_row_unchanged(ST_LISTENING, "ready"));
+
+        // A mid-listen write moved the row off listening/ready — restore it.
+        assert!(!listen_exit_row_unchanged(ST_ACTIVE, "filter matched"));
+        assert!(!listen_exit_row_unchanged(ST_ACTIVE, "message received"));
+        assert!(!listen_exit_row_unchanged(ST_INACTIVE, "message received"));
+        assert!(!listen_exit_row_unchanged(ST_LISTENING, "spooled"));
     }
 
     /// NRM-083 G5: a filtered listen's receive write must report the queue,

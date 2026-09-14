@@ -124,10 +124,9 @@ pub fn check_identity_gate(
 /// These instance types need explicit status updates here:
 /// - Subagent: status is also updated directly for manual/non-hook invocations
 /// - Codex: has notify hook (turn-end) but no pre-tool hook
-/// - Adhoc: no hooks at all
 ///
 /// Status model:
-/// - Adhoc: inactive:tool:* (no hooks to reset, just records "this happened")
+/// - Adhoc: nothing (NRM-081 — see `hookless_command_write`)
 /// - Others: active:tool:* (hooks will reset to idle when turn ends)
 pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandContext) {
     if STATUS_SKIP_COMMANDS.contains(&cmd_name) {
@@ -157,22 +156,35 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
 
-    // Only set status for hookless instances:
-    // - subagent (has parent_name)
-    // - codex
-    // - adhoc
-    let is_hookless = has_parent || tool == "codex" || tool == "adhoc";
-    if !is_hookless {
+    let Some((status, context)) = hookless_command_write(tool, has_parent, cmd_name) else {
         return;
-    }
-
-    let context = format!("tool:{cmd_name}");
-    let status = if tool == "adhoc" {
-        ST_INACTIVE
-    } else {
-        ST_ACTIVE
     };
     lifecycle::set_status(db, &identity.name, status, &context, Default::default());
+}
+
+/// NRM-081 decision seam: the status row a hookless command runner should
+/// write, if any. NRM-072/080 style — pure function, unit-tested here.
+///
+/// - Not hookless (claude/gemini with PreToolUse hooks): None — the hooks own
+///   the status row.
+/// - Adhoc: None. Adhoc identities run hcom commands constantly (send, list,
+///   events, listen); an `inactive tool:<cmd>` row per command is display
+///   noise that reads as a dead instance, and mentionability (commands/send.rs
+///   treats adhoc senders as mentionable) does not depend on the row. The
+///   listen-timeout path (`commands/listen.rs`) remains the only writer of an
+///   adhoc `inactive` row, via the real `exit:timeout` transition.
+/// - Codex / subagent: `Some((ST_ACTIVE, "tool:<cmd>"))` — no pre-tool hook
+///   would otherwise show the command running.
+fn hookless_command_write(
+    tool: &str,
+    has_parent: bool,
+    cmd_name: &str,
+) -> Option<(&'static str, String)> {
+    let is_hookless = has_parent || tool == "codex" || tool == "adhoc";
+    if !is_hookless || tool == "adhoc" {
+        return None;
+    }
+    Some((ST_ACTIVE, format!("tool:{cmd_name}")))
 }
 
 /// For hookless instances (codex/adhoc): append unread messages after command output.
@@ -556,6 +568,37 @@ mod tests {
 
     // ── build_ctx_for_command tests ──
 
+    // ── hookless_command_write tests (NRM-081 seam) ──
+
+    use crate::shared::ST_ACTIVE;
+
+    #[test]
+    fn adhoc_command_write_is_suppressed() {
+        // NRM-081: an inactive tool:<cmd> row per hcom command reads as dead.
+        assert!(hookless_command_write("adhoc", false, "send").is_none());
+        assert!(hookless_command_write("adhoc", false, "list").is_none());
+        assert!(hookless_command_write("adhoc", false, "events").is_none());
+    }
+
+    #[test]
+    fn codex_and_subagent_keep_their_active_command_row() {
+        let (status, context) = hookless_command_write("codex", false, "send").unwrap();
+        assert_eq!(status, ST_ACTIVE);
+        assert_eq!(context, "tool:send");
+
+        // Subagent: no pre-tool hook of its own, tool may be anything.
+        let (status, context) = hookless_command_write("claude", true, "send").unwrap();
+        assert_eq!(status, ST_ACTIVE);
+        assert_eq!(context, "tool:send");
+    }
+
+    #[test]
+    fn hooked_instances_write_nothing_at_the_command_seam() {
+        assert!(hookless_command_write("claude", false, "send").is_none());
+        assert!(hookless_command_write("gemini", false, "list").is_none());
+        assert!(hookless_command_write("", false, "send").is_none());
+    }
+
     #[test]
     fn test_build_ctx_no_identity() {
         let (db, _dir) = make_test_db();
@@ -736,6 +779,9 @@ mod tests {
 
     #[test]
     fn test_hookless_status_adhoc() {
+        // NRM-081: an adhoc command writes nothing — the pre-command row
+        // (typically listening) is the truthful one, and an `inactive
+        // tool:<cmd>` row per command read as a dead instance.
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", "adhoc");
         let ctx = CommandContext {
@@ -750,8 +796,8 @@ mod tests {
         };
         set_hookless_command_status(&db, "events", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(data.status, ST_INACTIVE);
-        assert_eq!(data.status_context, "tool:events");
+        assert_eq!(data.status, "active"); // unchanged from INSERT
+        assert_eq!(data.status_context, ""); // unchanged from INSERT
     }
 
     #[test]
