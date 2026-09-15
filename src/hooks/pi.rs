@@ -14,7 +14,6 @@ use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 
 use super::common;
-use super::common::finalize_session;
 
 fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
     argv.iter()
@@ -268,7 +267,8 @@ fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
         None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
     };
     let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
-    finalize_session(db, &name, &reason, None);
+    let session_id = parse_flag(argv, "--session-id");
+    common::finalize_session_gated(db, &name, &reason, None, session_id.as_deref());
     (0, r#"{"ok":true}"#.to_string())
 }
 

@@ -692,7 +692,13 @@ fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     };
     let instance_name = &instance.name;
 
-    common::finalize_session(db, instance_name, "sessionend", None);
+    common::finalize_session_gated(
+        db,
+        instance_name,
+        "sessionend",
+        None,
+        payload.session_id.as_deref(),
+    );
 
     hook_noop()
 }
