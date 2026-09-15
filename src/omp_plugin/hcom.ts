@@ -494,7 +494,9 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			const stopName = instanceName;
 			let softStopOk = false;
 			try {
-				const result = await hcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
+				const result = await hcom(sessionId
+					? ["omp-stop", "--name", stopName, "--reason", reason, "--session-id", sessionId, "--soft"]
+					: ["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
 				if (result.code === 0) {
 					softStopOk = true;
 				} else {

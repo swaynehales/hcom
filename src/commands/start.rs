@@ -438,6 +438,17 @@ fn start_rebind(
         ensure_rebind_compatible(&target_name, meta, ctx)?;
     }
 
+    // A claimer with no resolvable session ref is not performing a succession.
+    // Allowing it would insert a row with a NULL session id — a claim the D2
+    // gate can never attribute and nothing can safely tear down but the reaper.
+    // Checked after the tool/cwd hijack refusals so those errors win.
+    let Some(_) = session_id else {
+        eprintln!(
+            "Error: refusing to claim '{target_name}': this session has no resolvable session id. A succession claim must carry a session ref (run inside the tool session, or set CLAUDE_CODE_SESSION_ID)."
+        );
+        return Ok(1);
+    };
+
     // Preserve last_event_id from target (cursor preservation)
     let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
@@ -1254,6 +1265,28 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_claim_without_session_ref_refuses() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        log_stopped_snapshot(&db, "nova", "claude", "/tmp/nrm053-nosid", "sid-nova", 9);
+
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/nrm053-nosid");
+        let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
+
+        assert_eq!(
+            exit_code, 1,
+            "a claimer with no resolvable session ref must refuse"
+        );
+        assert!(
+            db.get_instance_full("nova").unwrap().is_none(),
+            "the refusal must not insert an unattributable row"
+        );
+        assert_eq!(tombstone_count(&db, "nova"), 1, "the old tombstone stays");
+    }
+
+    #[test]
+    #[serial]
     fn test_d3_own_session_live_row_updates_in_place() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
@@ -1756,7 +1789,10 @@ mod tests {
         );
 
         let ctx = make_ctx(
-            &[("CLAUDECODE", "1")],
+            &[
+                ("CLAUDECODE", "1"),
+                ("CLAUDE_CODE_SESSION_ID", "sid-claim"),
+            ],
             "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
         );
 
