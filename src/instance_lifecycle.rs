@@ -1582,7 +1582,6 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         );
     }
 
-    #[test]
     /// A stale row whose recorded pid is ALIVE must survive the reaper —
     /// one `hcom list` must not turn a refused claim into a kill.
     #[test]
