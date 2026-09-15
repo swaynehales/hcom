@@ -826,6 +826,38 @@ impl HcomDb {
         Ok(rows > 0)
     }
 
+    /// Transaction-scoped [`save_instance_named`] for the atomic name claim:
+    /// row insert, bindings, and succession bookkeeping must commit or roll
+    /// back together.
+    pub fn save_instance_named_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        name: &str,
+        data: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<bool> {
+        let mut cols = vec!["name"];
+        let mut placeholders = vec!["?"];
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(name.to_string())];
+
+        for (key, val) in data {
+            if key == "name" {
+                continue;
+            }
+            cols.push(Self::validate_column(key)?);
+            placeholders.push("?");
+            values.push(Self::json_value_to_sql(val));
+        }
+
+        let sql = format!(
+            "INSERT OR REPLACE INTO instances ({}) VALUES ({})",
+            cols.join(", "),
+            placeholders.join(", ")
+        );
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|b| b.as_ref()).collect();
+        let rows = tx.execute(&sql, refs.as_slice())?;
+        Ok(rows > 0)
+    }
+
     /// Update specific fields on an instance row.
     /// Uses a JSON Value map for flexible field specification.
     pub fn update_instance_fields(

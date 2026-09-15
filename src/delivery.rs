@@ -3077,13 +3077,57 @@ pub(crate) fn log_pty_cleanup_skipped(db: &HcomDb, current_name: &str) {
     );
 }
 
+/// D2 gate for the native wrapper exit: the ending session id is this
+/// process's process-binding session. A late wrapper exit whose binding is
+/// gone (a succession claim deleted it) or whose row no longer carries that
+/// session must not write by name — the successor would be marked inactive.
+/// An empty process_id keeps the ungated legacy behavior.
+fn session_exit_gate_allows(db: &HcomDb, current_name: &str, process_id: &str) -> bool {
+    if process_id.is_empty() {
+        return true;
+    }
+    let Ok(Some((bound_session, bound_name))) = db.get_process_binding_full(process_id) else {
+        log_warn(
+            "native",
+            "delivery.exit_gate_skip",
+            &format!(
+                "instance={current_name} process binding gone — late wrapper exit skipped"
+            ),
+        );
+        return false;
+    };
+    if bound_name != current_name {
+        return false;
+    }
+    let Some(sid) = bound_session.as_deref().filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    match db.get_instance_full(current_name) {
+        Ok(Some(row)) => {
+            if row.session_id.as_deref() != Some(sid) {
+                log_warn(
+                    "native",
+                    "delivery.exit_gate_skip",
+                    &format!(
+                        "instance={current_name} ending_session={sid} row_session={:?} — late wrapper exit skipped",
+                        row.session_id
+                    ),
+                );
+                return false;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn cleanup_pty_exit_default(
     db: &mut HcomDb,
     current_name: &str,
     process_id: &str,
     owns_instance: bool,
 ) {
-    if owns_instance {
+    if owns_instance && session_exit_gate_allows(db, current_name, process_id) {
         cleanup_deleted_instance(db, current_name);
     } else {
         log_pty_cleanup_skipped(db, current_name);
@@ -3099,6 +3143,91 @@ fn cleanup_pty_exit_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_session_exit_gate_blocks_late_wrapper_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("t.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('luna', 'sess-1', 'claude', 'active', 'running', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-1', 'luna', 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-1', 'sess-1', 'luna', 1)",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            session_exit_gate_allows(&db, "luna", "pid-1"),
+            "the owning wrapper's own exit must pass the gate"
+        );
+
+        // Succession: the winner re-pointed the row to a new session and the
+        // claim deleted the old process binding.
+        db.conn()
+            .execute("DELETE FROM process_bindings WHERE process_id = 'pid-1'", [])
+            .unwrap();
+        assert!(
+            !session_exit_gate_allows(&db, "luna", "pid-1"),
+            "a wrapper whose process binding is gone must be gated off"
+        );
+
+        // Row moved to a successor session while the stale binding lingers.
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-1', 'sess-1', 'luna', 2)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute("UPDATE instances SET session_id = 'sess-2' WHERE name = 'luna'", [])
+            .unwrap();
+        assert!(
+            !session_exit_gate_allows(&db, "luna", "pid-1"),
+            "a late wrapper exit must not write on the successor's row"
+        );
+
+        // End to end: the gated-off exit leaves the successor's status alone.
+        let mut db2 = db;
+        cleanup_pty_exit_default(&mut db2, "luna", "pid-1", true);
+        let row = db2.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+    }
+
+    #[test]
+    fn test_session_exit_gate_empty_pid_keeps_legacy_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("t.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('luna', 'sess-1', 'claude', 'active', 'running', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            session_exit_gate_allows(&db, "luna", ""),
+            "no pid info cannot gate — legacy behavior"
+        );
+    }
 
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {

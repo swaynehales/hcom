@@ -9,6 +9,7 @@
 //! - `--as`: rebind session identity
 
 use anyhow::{Result, bail};
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use crate::paths;
 use crate::pidtrack;
 use crate::relay;
 use crate::router::GlobalFlags;
-use crate::shared::constants::ST_ACTIVE;
+use crate::shared::constants::{ST_ACTIVE, ST_INACTIVE};
 use crate::shared::context::HcomContext;
 
 /// Parsed arguments for `hcom start`.
@@ -327,25 +328,44 @@ fn snapshot_child_links(db: &HcomDb, session_id: Option<&str>) -> Result<Vec<Chi
 }
 
 fn restore_child_links_after_root_rebind(
-    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
     links: &[ChildLink],
     session_id: &str,
     old_root: &str,
     new_root: &str,
 ) -> Result<()> {
-    db.with_immediate_transaction(|txn| {
-        for link in links {
-            let parent_name = match link.parent_name.as_deref() {
-                Some(parent) if parent == old_root => Some(new_root),
-                other => other,
-            };
-            txn.execute(
-                "UPDATE instances SET parent_session_id = ?, parent_name = ? WHERE name = ?",
-                rusqlite::params![session_id, parent_name, &link.name],
-            )?;
-        }
-        Ok(())
-    })
+    for link in links {
+        let parent_name = match link.parent_name.as_deref() {
+            Some(parent) if parent == old_root => Some(new_root),
+            other => other,
+        };
+        tx.execute(
+            "UPDATE instances SET parent_session_id = ?, parent_name = ? WHERE name = ?",
+            rusqlite::params![session_id, parent_name, &link.name],
+        )?;
+    }
+    Ok(())
+}
+
+/// D3 claim liveness: computed status over stored fields and heartbeat, with
+/// an alive-pid backstop — a stale-heartbeat row whose process is still
+/// running counts live, because `stop_instance` would group-kill it.
+fn claim_target_is_live(db: &HcomDb, row: &InstanceRow) -> bool {
+    let computed = lifecycle::get_instance_status(row, db);
+    if computed.status != ST_INACTIVE {
+        return true;
+    }
+    if let Some(pid) = row.pid
+        && pid > 0
+        && crate::sys::process::is_alive(pid as u32)
+    {
+        return true;
+    }
+    false
+}
+
+fn row_is_remote(row: &InstanceRow) -> bool {
+    row.origin_device_id.as_deref().is_some_and(|v| !v.is_empty())
 }
 
 /// Rebind session identity (`--as <name>`), preserving last_event_id and any
@@ -416,84 +436,237 @@ fn start_rebind(
     let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
 
+    // D3 liveness gate. The caller's own row (compaction re-run: its session
+    // is still bound to the target) and remote rows (relay continuity, updated
+    // in place) are exempt; everything else live refuses.
+    let own_session = session_id.as_deref().is_some_and(|sid| {
+        db.get_session_binding(sid)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(target_name.as_str())
+    });
+    let target_remote = target_data.as_ref().is_some_and(|row| row_is_remote(row));
+    if let Some(ref row) = target_data
+        && !own_session
+        && !target_remote
+        && claim_target_is_live(db, row)
+    {
+        eprintln!(
+            "Error: '{target_name}' is live. Refusing to claim a running identity — stop it first, or reclaim it after it exits."
+        );
+        return Ok(1);
+    }
+
     // Final fallback: use current max to avoid re-delivering old messages
     if last_event_id.is_none() {
         last_event_id = Some(db.get_last_event_id());
     }
 
-    // Skip delete for remote instances (origin_device_id)
-    if let Some(ref td) = target_data
-        && (td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some(""))
-        && let Err(e) = db.delete_instance(&target_name)
-    {
-        eprintln!("[hcom] warn: delete_instance failed for {target_name}: {e}");
-    }
-
-    // Clean up target's bindings
-    if let Err(e) = db.delete_process_bindings_for_instance(&target_name) {
-        eprintln!("[hcom] warn: delete_process_bindings failed for {target_name}: {e}");
-    }
-    if let Err(e) = db.delete_session_bindings_for_instance(&target_name) {
-        eprintln!("[hcom] warn: delete_session_bindings failed for {target_name}: {e}");
-    }
-
-    // Delete old identity if different from target
-    if !current_name.is_empty()
-        && current_name != target_name
-        && let Err(e) = db.delete_instance(&current_name)
-    {
-        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
-    }
-
-    // Create fresh instance with the target name
     let tool = ctx.tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    instance_binding::initialize_instance_in_position_file(
-        db,
-        &target_name,
-        session_id.as_deref(),
-        None, // parent_session_id
-        None, // parent_name
-        None, // agent_id
-        None, // transcript_path
-        Some(tool),
-        false, // background
-        None,  // tag
-        None,  // wait_timeout
-        None,  // subagent_timeout
-        None,  // hints
-        Some(&cwd_override),
-    );
 
+    // D1 phase 1 — predecessor stops run OUTSIDE the claim transaction
+    // (finalize_instance_stop opens its own BEGIN IMMEDIATE, which does not
+    // nest). D8: the stops go through finalize_instance_stop directly, never
+    // stop_instance — no subagent recursion, no pid signals on a possibly
+    // alive process, and the CAS means a row replaced mid-teardown is not
+    // touched.
+    if let Some(ref row) = target_data
+        && !target_remote
+        && !own_session
+    {
+        let snapshot = db
+            .get_instance_snapshot(&target_name)
+            .ok()
+            .flatten()
+            .unwrap_or(serde_json::Value::Null);
+        if let Err(e) = db.finalize_instance_stop(
+            &target_name,
+            row.created_at,
+            row.session_id.as_deref(),
+            row.agent_id.as_deref(),
+            &json!({
+                "action": "stopped",
+                "by": "start --as",
+                "reason": "succession-claimed",
+                "snapshot": snapshot,
+            }),
+        ) {
+            eprintln!("[hcom] warn: succession stop of {target_name} failed: {e}");
+        }
+    }
+
+    // D8 ordering — rename path: migrate notify endpoints BEFORE the rename
+    // stop, so the wake ports survive under the target name when the old
+    // identity is tombstoned. The rename tombstone carries `renamed_to` so a
+    // later resume of the old name refuses instead of relaunching a moved
+    // identity.
+    if !current_name.is_empty() && current_name != target_name {
+        if ctx.process_id.is_some()
+            && let Err(e) = db.migrate_notify_endpoints(&current_name, &target_name)
+        {
+            eprintln!("[hcom] warn: migrate_notify_endpoints failed: {e}");
+        }
+        if let Ok(Some(cur_row)) = db.get_instance_full(&current_name) {
+            let snapshot = db
+                .get_instance_snapshot(&current_name)
+                .ok()
+                .flatten()
+                .unwrap_or(serde_json::Value::Null);
+            if let Err(e) = db.finalize_instance_stop(
+                &current_name,
+                cur_row.created_at,
+                cur_row.session_id.as_deref(),
+                cur_row.agent_id.as_deref(),
+                &json!({
+                    "action": "stopped",
+                    "by": "start --as",
+                    "reason": "renamed",
+                    "renamed_to": target_name,
+                    "session_id": serde_json::Value::Null,
+                    "snapshot": snapshot,
+                }),
+            ) {
+                eprintln!("[hcom] warn: rename stop of {current_name} failed: {e}");
+            }
+        }
+    }
+
+    // D1 phase 2 — the claim: one BEGIN IMMEDIATE covering the CAS re-check,
+    // row insert (or in-place update for the caller's own row), binding
+    // cleanup, session/process bindings, and child-link restore. Two fresh
+    // claimers serialize here; the loser's CAS read finds a row and bails.
+    let sid = session_id.clone();
+    let claim = db.with_immediate_transaction(|tx| {
+        let existing: Option<(f64, i64)> = tx
+            .query_row(
+                "SELECT created_at, last_event_id FROM instances WHERE name = ?",
+                rusqlite::params![&target_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (in_place_created_at, in_place_cursor) = match existing {
+            Some((created_at, cursor)) => {
+                if !own_session {
+                    bail!("'{target_name}' was claimed concurrently");
+                }
+                (Some(created_at), Some(cursor))
+            }
+            None => (None, None),
+        };
+
+        tx.execute(
+            "DELETE FROM session_bindings WHERE instance_name = ?",
+            rusqlite::params![&target_name],
+        )?;
+        tx.execute(
+            "DELETE FROM process_bindings WHERE instance_name = ?",
+            rusqlite::params![&target_name],
+        )?;
+        if let Some(ref s) = sid {
+            tx.execute(
+                "UPDATE instances SET session_id = NULL WHERE session_id = ? AND name != ?",
+                rusqlite::params![s, &target_name],
+            )?;
+        }
+
+        let now = crate::shared::time::now_epoch_f64();
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "session_id".into(),
+            match sid {
+                Some(ref s) if !s.is_empty() => json!(s),
+                _ => serde_json::Value::Null,
+            },
+        );
+        data.insert("directory".into(), json!(cwd_override));
+        data.insert("tool".into(), json!(tool));
+        data.insert("background".into(), json!(0));
+        data.insert("name_announced".into(), json!(1));
+        if let Some(eid) = last_event_id {
+            data.insert("last_event_id".into(), json!(eid));
+        }
+        if let Some(created_at) = in_place_created_at {
+            data.insert("created_at".into(), json!(created_at));
+            if let Some(cursor) = in_place_cursor
+                && last_event_id.is_none()
+            {
+                data.insert("last_event_id".into(), json!(cursor));
+            }
+        } else {
+            data.insert("created_at".into(), json!(now));
+            data.insert("last_stop".into(), json!(0));
+            data.insert("transcript_path".into(), json!(""));
+            data.insert("tag".into(), serde_json::Value::Null);
+            data.insert("status".into(), json!(ST_INACTIVE));
+            data.insert("status_time".into(), json!(crate::shared::time::now_epoch_i64()));
+            data.insert("status_context".into(), json!("new"));
+            data.insert(
+                "wait_timeout".into(),
+                json!(HcomConfig::effective_timeout()),
+            );
+        }
+        HcomDb::save_instance_named_in_tx(tx, &target_name, &data)?;
+
+        if let Some(ref s) = sid {
+            tx.execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     instance_name = excluded.instance_name,
+                     created_at = excluded.created_at",
+                rusqlite::params![s, &target_name, now],
+            )?;
+        }
+        if let Some(ref process_id) = ctx.process_id {
+            let pid_sid = sid.as_deref().unwrap_or("");
+            tx.execute(
+                "INSERT OR REPLACE INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    process_id,
+                    if pid_sid.is_empty() {
+                        None
+                    } else {
+                        Some(pid_sid)
+                    },
+                    &target_name,
+                    now
+                ],
+            )?;
+        }
+
+        if let Some(ref s) = sid {
+            let old_root = if current_name.is_empty() {
+                target_name.as_str()
+            } else {
+                current_name.as_str()
+            };
+            restore_child_links_after_root_rebind(tx, &child_links, s, old_root, &target_name)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = claim {
+        eprintln!("Error: claim of '{target_name}' failed: {e}");
+        return Ok(1);
+    }
+
+    // Post-claim bookkeeping outside the transaction: Claude actor state and
+    // the validated-session cache are keyed by session id and are recovered by
+    // a later hook if they fail here.
     if let Some(ref sid) = session_id {
         let old_root = if current_name.is_empty() {
             target_name.as_str()
         } else {
             current_name.as_str()
         };
-        restore_child_links_after_root_rebind(db, &child_links, sid, old_root, &target_name)?;
-        if old_root != target_name {
-            db.rebind_claude_root_actor_state(sid, old_root, &target_name)?;
+        if old_root != target_name
+            && let Err(e) = db.rebind_claude_root_actor_state(sid, old_root, &target_name)
+        {
+            eprintln!("[hcom] warn: rebind_claude_root_actor_state failed for {target_name}: {e}");
         }
-    }
-
-    // Restore cursor position + mark as announced
-    {
-        let mut updates = serde_json::Map::new();
-        if let Some(eid) = last_event_id {
-            updates.insert("last_event_id".into(), serde_json::json!(eid));
-        }
-        updates.insert("name_announced".into(), serde_json::json!(1));
-        if let Err(e) = db.update_instance_fields(&target_name, &updates) {
-            eprintln!("[hcom] warn: update_instance_fields failed for {target_name}: {e}");
-        }
-    }
-
-    // Create bindings
-    if let Some(ref sid) = session_id {
-        if let Err(e) = db.set_session_binding(sid, &target_name) {
-            eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
-        } else if ctx.tool == crate::tool::Tool::Claude
+        if ctx.tool == crate::tool::Tool::Claude
             && let Err(e) = db.mark_claude_session_validated(sid, &target_name)
         {
             // The cache still names the identity being replaced, and it is keyed
@@ -504,20 +677,25 @@ fn start_rebind(
             eprintln!("[hcom] warn: mark_claude_session_validated failed for {target_name}: {e}");
         }
     }
-    if let Some(ref process_id) = ctx.process_id {
-        let sid = session_id.as_deref().unwrap_or("");
-        if let Err(e) = db.set_process_binding(process_id, sid, &target_name) {
-            eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
-        }
 
-        // Migrate notify endpoints before notify so wake reaches correct port
-        if !current_name.is_empty()
-            && current_name != target_name
-            && let Err(e) = db.migrate_notify_endpoints(&current_name, &target_name)
-        {
-            eprintln!("[hcom] warn: migrate_notify_endpoints failed: {e}");
-        }
+    // Fresh-claim parity with initialize_instance_in_position_file's created
+    // path: default subscriptions and the created life event. Best-effort.
+    if !own_session && !target_remote {
+        let _ = db.log_event(
+            "life",
+            &target_name,
+            &json!({
+                "action": "created",
+                "by": "start --as",
+                "is_hcom_launched": false,
+                "is_subagent": false,
+                "parent_name": "",
+            }),
+        );
+        instance_binding::auto_subscribe_defaults(db, &target_name, tool);
+    }
 
+    if ctx.process_id.is_some() {
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
@@ -1272,7 +1450,10 @@ mod tests {
             )
             .unwrap();
 
-        restore_child_links_after_root_rebind(&db, &links, "sess-1", "nova", "sol").unwrap();
+        db.with_immediate_transaction(|tx| {
+            restore_child_links_after_root_rebind(tx, &links, "sess-1", "nova", "sol")
+        })
+        .unwrap();
         db.rebind_claude_root_actor_state("sess-1", "nova", "sol")
             .unwrap();
 

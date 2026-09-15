@@ -1305,7 +1305,61 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, None)
+}
+
+/// Stop gated on the ending session id.
+///
+/// When `ending_session_id` is `Some(sid)`, the stop proceeds only if the
+/// row still belongs to that session — a session that lost its identity
+/// (succession claimed the name mid-teardown) must not delete the winner's
+/// row. `None` keeps the ungated behavior (kill, reaper).
+pub fn stop_instance_for_session(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    ending_session_id: Option<&str>,
+) -> StopOutcome {
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        ending_session_id,
+    )
+}
+
+/// D2 gate: when an ending session id is supplied, the row must still carry it.
+/// `None` means the caller is session-less by design (kill, reaper) — ungated.
+pub(crate) fn session_gate_allows(
+    db: &HcomDb,
+    instance_name: &str,
+    ending_session_id: Option<&str>,
+) -> bool {
+    let Some(sid) = ending_session_id.filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    match db.get_instance_full(instance_name) {
+        Ok(Some(row)) => {
+            if row.session_id.as_deref() != Some(sid) {
+                log::log_warn(
+                    "hooks",
+                    "sessionend.gated_skip",
+                    &format!(
+                        "instance={} ending_session={} row_session={:?} — by-name teardown skipped",
+                        instance_name, sid, row.session_id
+                    ),
+                );
+                return false;
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1321,7 +1375,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, None)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1346,6 +1400,7 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
+    expected_session: Option<&str>,
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1370,6 +1425,12 @@ fn stop_instance_inner(
             ));
         }
     };
+
+    // D2 gate, re-checked after the row read so the check and the teardown
+    // see the same row generation.
+    if !session_gate_allows_inner(instance_name, &instance_data, expected_session) {
+        return StopOutcome::AlreadyStopped;
+    }
 
     // Kill headless processes (background=true)
     let pid = instance_data.pid;
@@ -1534,6 +1595,7 @@ fn stop_instance_inner(
             "parent_stopped",
             false,
             depth + 1,
+            None,
         ) {
             log::log_warn(
                 "hooks",
@@ -1550,9 +1612,15 @@ fn stop_instance_inner(
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        if let StopOutcome::RetryableError(error) =
-            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
-        {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+            db,
+            &child,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+            None,
+        ) {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
@@ -1635,11 +1703,29 @@ pub fn soft_finalize_session(
     updates: Option<&serde_json::Map<String, Value>>,
     keep_process_binding: bool,
 ) {
+    soft_finalize_session_gated(db, instance_name, reason, updates, keep_process_binding, None)
+}
+
+/// Session-gated [`soft_finalize_session`] — same D2 gate as
+/// [`finalize_session_gated`]: every by-name write runs only while the row
+/// still belongs to `ending_session_id` (`None` = ungated).
+pub fn soft_finalize_session_gated(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+    keep_process_binding: bool,
+    ending_session_id: Option<&str>,
+) {
     log::log_info(
         "hooks",
         "sessionend.soft",
         &format!("instance={} reason={}", instance_name, reason),
     );
+
+    if !session_gate_allows(db, instance_name, ending_session_id) {
+        return;
+    }
 
     lifecycle::set_status(
         db,
@@ -1719,6 +1805,30 @@ pub fn soft_finalize_session(
     }
 }
 
+/// D2 gate variant over an already-read row: the check and the teardown see
+/// the same row generation.
+pub(crate) fn session_gate_allows_inner(
+    instance_name: &str,
+    row: &crate::db::InstanceRow,
+    ending_session_id: Option<&str>,
+) -> bool {
+    let Some(sid) = ending_session_id.filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    if row.session_id.as_deref() != Some(sid) {
+        log::log_warn(
+            "hooks",
+            "sessionend.gated_skip",
+            &format!(
+                "instance={} ending_session={} row_session={:?} — by-name teardown skipped",
+                instance_name, sid, row.session_id
+            ),
+        );
+        return false;
+    }
+    true
+}
+
 /// Set inactive status, persist updates, and stop instance.
 ///
 /// Common to Claude and Gemini SessionEnd handlers. Catches all errors
@@ -1730,11 +1840,31 @@ pub fn finalize_session(
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
 ) {
+    finalize_session_gated(db, instance_name, reason, updates, None)
+}
+
+/// Session-gated [`finalize_session`].
+///
+/// Every by-name write (status, position, stop) runs only when the row still
+/// belongs to `ending_session_id` — a session that lost its name to a
+/// succession mid-teardown must not mark or delete the winner's row.
+/// `ending_session_id: None` keeps the ungated behavior.
+pub fn finalize_session_gated(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+    ending_session_id: Option<&str>,
+) {
     log::log_info(
         "hooks",
         "sessionend",
         &format!("instance={} reason={}", instance_name, reason),
     );
+
+    if !session_gate_allows(db, instance_name, ending_session_id) {
+        return;
+    }
 
     // Set inactive status
     lifecycle::set_status(
@@ -1751,7 +1881,7 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    stop_instance_for_session(db, instance_name, "session", &format!("exit:{}", reason), ending_session_id);
 }
 
 /// Update instance status for tool execution.
@@ -3005,6 +3135,107 @@ mod tests {
         assert_eq!(
             db.get_status("luna").unwrap().map(|(s, _)| s),
             Some(ST_INACTIVE.to_string())
+        );
+    }
+
+    fn insert_gated_instance(db: &crate::db::HcomDb, name: &str, session_id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES (?1, ?2, 'claude', 'active', 'running', 0, 1, 0)",
+                rusqlite::params![name, session_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_finalize_session_gated_wrong_session_writes_nothing() {
+        let (_dir, db) = make_test_db();
+        insert_gated_instance(&db, "luna", "sess-1");
+
+        finalize_session_gated(&db, "luna", "user_quit", None, Some("sess-other"));
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.status, "active",
+            "a session that does not own the row must not mark it inactive"
+        );
+        assert_eq!(row.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn test_finalize_session_gated_matching_session_stops() {
+        let (_dir, db) = make_test_db();
+        insert_gated_instance(&db, "luna", "sess-1");
+
+        finalize_session_gated(&db, "luna", "user_quit", None, Some("sess-1"));
+
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "the owning session's teardown must proceed"
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 1);
+    }
+
+    #[test]
+    fn test_finalize_session_ungated_keeps_legacy_behavior() {
+        let (_dir, db) = make_test_db();
+        insert_gated_instance(&db, "luna", "sess-1");
+
+        finalize_session(&db, "luna", "user_quit", None);
+
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "the legacy 4-arg path (kill/reaper callers) must stay ungated"
+        );
+    }
+
+    #[test]
+    fn test_stop_instance_for_session_gates_on_row_session() {
+        let (_dir, db) = make_test_db();
+        insert_gated_instance(&db, "luna", "sess-1");
+
+        let outcome = stop_instance_for_session(&db, "luna", "test", "reason", Some("sess-x"));
+        assert_eq!(outcome, StopOutcome::AlreadyStopped);
+        assert!(
+            db.get_instance_full("luna").unwrap().is_some(),
+            "a gated stop for a foreign session must not delete the row"
+        );
+
+        let outcome = stop_instance_for_session(&db, "luna", "test", "reason", Some("sess-1"));
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_soft_finalize_session_gated_wrong_session_keeps_status() {
+        let (_dir, db) = make_test_db();
+        insert_gated_instance(&db, "luna", "sess-1");
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-1', 'luna', 1)",
+                [],
+            )
+            .unwrap();
+
+        soft_finalize_session_gated(&db, "luna", "turn_end", None, false, Some("sess-other"));
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(
+            db.get_session_binding("sess-1").unwrap().as_deref(),
+            Some("luna"),
+            "the session binding must survive a foreign session's soft stop"
         );
     }
 }
