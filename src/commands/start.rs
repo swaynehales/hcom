@@ -38,9 +38,24 @@ pub struct StartArgs {
     /// Rebind to a different instance name
     #[arg(long = "as")]
     pub as_name: Option<String>,
+    /// Adopt a name with no row and no tombstone (D6 escape hatch; the
+    /// resulting claim is provisional)
+    #[arg(long = "adopt-unknown")]
+    pub adopt_unknown: bool,
+    /// Take over a LIVE identity (D4b: live takeover and nothing else; the
+    /// displaced session ref is logged)
+    #[arg(long)]
+    pub force: bool,
     /// Recover orphaned PTY process by name or PID
     #[arg(long)]
     pub orphan: Option<String>,
+}
+
+/// Claim-policy flags threaded into the rebind/claim path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClaimOptions {
+    pub adopt_unknown: bool,
+    pub force: bool,
 }
 
 /// Run the start command.
@@ -74,6 +89,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 
     let orphan_target = start_args.orphan;
     let rebind_target = start_args.as_name;
+    let claim_opts = ClaimOptions {
+        adopt_unknown: start_args.adopt_unknown,
+        force: start_args.force,
+    };
 
     let db = HcomDb::open()?;
     let hcom_dir = paths::hcom_dir();
@@ -138,7 +157,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             .as_ref()
             .map(|actor| actor.name.as_str())
             .or(requested_name.as_deref());
-        return start_rebind(&db, &rebind, &ctx, current_name);
+        return start_rebind_opts(&db, &rebind, &ctx, current_name, claim_opts);
     }
 
     if let Some(subagent) = subagent_via_name {
@@ -376,6 +395,16 @@ fn start_rebind(
     ctx: &HcomContext,
     explicit_name: Option<&str>,
 ) -> Result<i32> {
+    start_rebind_opts(db, rebind_target, ctx, explicit_name, ClaimOptions::default())
+}
+
+fn start_rebind_opts(
+    db: &HcomDb,
+    rebind_target: &str,
+    ctx: &HcomContext,
+    explicit_name: Option<&str>,
+    opts: ClaimOptions,
+) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
     // D5: validate the requested name on every claim entry point; the Ok
@@ -436,24 +465,24 @@ fn start_rebind(
         ensure_rebind_compatible(&target_name, meta, ctx)?;
     }
 
-    // A claimer with no resolvable session ref is not performing a succession.
-    // Allowing it would insert a row with a NULL session id — a claim the D2
-    // gate can never attribute and nothing can safely tear down but the reaper.
-    // Checked after the tool/cwd hijack refusals so those errors win.
-    let Some(_) = session_id else {
-        eprintln!(
-            "Error: refusing to claim '{target_name}': this session has no resolvable session id. A succession claim must carry a session ref (run inside the tool session, or set CLAUDE_CODE_SESSION_ID)."
-        );
-        return Ok(1);
-    };
-
     // Preserve last_event_id from target (cursor preservation)
     let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
 
+    // D6: a name with no row and no tombstone is not a free claim — it lets
+    // anyone adopt an archived role name with no metadata to check. Gated
+    // behind --adopt-unknown on start --as only (D4b).
+    if target_data.is_none() && target_meta.is_none() && !opts.adopt_unknown {
+        eprintln!(
+            "Error: '{target_name}' has no identity history (no row, no tombstone). Refusing an unknown-name claim — pass --adopt-unknown to adopt it as a provisional name."
+        );
+        return Ok(1);
+    }
+
     // D3 liveness gate. The caller's own row (compaction re-run: its session
     // is still bound to the target) and remote rows (relay continuity, updated
-    // in place) are exempt; everything else live refuses.
+    // in place) are exempt; everything else live refuses — unless --force
+    // (D4b: live takeover and nothing else).
     let own_session = session_id.as_deref().is_some_and(|sid| {
         db.get_session_binding(sid)
             .ok()
@@ -467,10 +496,29 @@ fn start_rebind(
         && !target_remote
         && claim_target_is_live(db, row)
     {
-        eprintln!(
-            "Error: '{target_name}' is live. Refusing to claim a running identity — stop it first, or reclaim it after it exits."
+        if !opts.force {
+            eprintln!(
+                "Error: '{target_name}' is live. Refusing to claim a running identity — stop it first, reclaim it after it exits, or pass --force to take it over."
+            );
+            return Ok(1);
+        }
+        let _ = db.log_event(
+            "life",
+            &target_name,
+            &json!({
+                "action": "force_claim",
+                "by": "start --as",
+                "reason": "live takeover",
+                "displaced_name": target_name,
+                "displaced_session_id": row.session_id,
+                "claimer_session_id": session_id,
+            }),
         );
-        return Ok(1);
+        log_info(
+            "start",
+            "claim.force",
+            &format!("instance={} displaced_session={:?}", target_name, row.session_id),
+        );
     }
 
     // Final fallback: use current max to avoid re-delivering old messages
@@ -1135,7 +1183,7 @@ mod tests {
             Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
             cwd,
         );
-        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions { adopt_unknown: true, force: false }).unwrap();
 
         assert_eq!(result, 1, "a stale row with a live pid must refuse the claim");
         assert!(
@@ -1167,7 +1215,7 @@ mod tests {
             Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
             cwd,
         );
-        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions { adopt_unknown: true, force: false }).unwrap();
 
         assert_eq!(result, 0, "a stale row with a dead pid is a valid succession");
         let row = db.get_instance_full("nova").unwrap().unwrap();
@@ -1206,7 +1254,7 @@ mod tests {
             Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
             cwd,
         );
-        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions { adopt_unknown: true, force: false }).unwrap();
 
         assert_eq!(result, 1, "a fresh active row must refuse the claim");
         assert!(db.get_instance_full("nova").unwrap().is_some());
@@ -1214,24 +1262,108 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_claim_without_session_ref_refuses() {
+    fn test_d6_unknown_name_claim_refused_without_adopt_unknown() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-d6";
+        std::fs::create_dir_all(cwd).unwrap();
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
 
-        log_stopped_snapshot(&db, "nova", "claude", "/tmp/nrm053-nosid", "sid-nova", 9);
+        let refused =
+            start_rebind_opts(&db, "novaname", &ctx, None, ClaimOptions::default()).unwrap();
+        assert_eq!(refused, 1, "an unknown name must be refused without --adopt-unknown");
+        assert!(db.get_instance_full("novaname").unwrap().is_none());
 
-        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/nrm053-nosid");
-        let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let adopted = start_rebind_opts(
+            &db,
+            "novaname",
+            &ctx,
+            None,
+            ClaimOptions { adopt_unknown: true, force: false },
+        )
+        .unwrap();
+        assert_eq!(adopted, 0, "--adopt-unknown allows the provisional claim");
+        assert!(db.get_instance_full("novaname").unwrap().is_some());
+    }
 
+    #[test]
+    #[serial]
+    fn test_d4b_force_takes_over_live_row_and_logs_displaced_session() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let (mut child, pid) = spawn_live_pid();
+        let cwd = "/tmp/nrm053-d4b";
+        std::fs::create_dir_all(cwd).unwrap();
+        insert_claim_target(
+            &db,
+            "nova",
+            Some(pid),
+            crate::shared::time::now_epoch_i64() - 1000,
+            cwd,
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'sid-victim' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+
+        let refused = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions::default()).unwrap();
+        assert_eq!(refused, 1, "live takeover must require --force");
+        assert!(db.get_instance_full("nova").unwrap().is_some());
+
+        let forced = start_rebind_opts(
+            &db,
+            "nova",
+            &ctx,
+            None,
+            ClaimOptions { adopt_unknown: false, force: true },
+        )
+        .unwrap();
+        assert_eq!(forced, 0, "--force takes over the live identity");
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("sess-claim"));
+
+        let force_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"force_claim\"%'
+                   AND data LIKE '%sid-victim%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(
-            exit_code, 1,
-            "a claimer with no resolvable session ref must refuse"
+            force_events, 1,
+            "the takeover must log a force_claim event carrying the displaced session ref"
         );
-        assert!(
-            db.get_instance_full("nova").unwrap().is_none(),
-            "the refusal must not insert an unattributable row"
-        );
-        assert_eq!(tombstone_count(&db, "nova"), 1, "the old tombstone stays");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_start_args_force_and_adopt_unknown() {
+        let args = StartArgs::try_parse_from([
+            "start",
+            "--as",
+            "luna",
+            "--force",
+            "--adopt-unknown",
+        ])
+        .unwrap();
+        assert_eq!(args.as_name.as_deref(), Some("luna"));
+        assert!(args.force);
+        assert!(args.adopt_unknown);
     }
 
     #[test]
@@ -1266,7 +1398,7 @@ mod tests {
             Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
             cwd,
         );
-        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions { adopt_unknown: true, force: false }).unwrap();
 
         assert_eq!(result, 0, "the compaction re-run reclaims its own live row");
         let row = db.get_instance_full("nova").unwrap().unwrap();
@@ -1518,7 +1650,7 @@ mod tests {
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let first = db.get_session_binding("sess-rebind").unwrap().unwrap();
 
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions { adopt_unknown: true, force: false }).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-rebind").unwrap().as_deref(),
             Some("nova"),

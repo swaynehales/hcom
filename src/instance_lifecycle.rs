@@ -782,6 +782,19 @@ pub fn cleanup_stale_instances(
                 continue;
             }
 
+            // A stale row whose recorded pid is still alive is a live process
+            // the status fields have lost track of — stop_instance would
+            // group-kill it. Spared here; the pid backstop must agree with
+            // the claim path's (D3).
+            if data.pid.is_some_and(|pid| pid > 0 && crate::sys::process::is_alive(pid as u32)) {
+                crate::log::log_info(
+                    "cleanup",
+                    "skip_live_pid",
+                    &format!("instance={} pid={:?} stale but process alive", data.name, data.pid),
+                );
+                continue;
+            }
+
             let context = &computed.context;
             let age = computed.age_seconds;
 
@@ -1570,6 +1583,66 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
     }
 
     #[test]
+    /// A stale row whose recorded pid is ALIVE must survive the reaper —
+    /// one `hcom list` must not turn a refused claim into a kill.
+    #[test]
+    fn test_cleanup_stale_instances_spares_live_pid() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep for live-pid reaper test");
+        let pid = child.id() as i64;
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("zombie"));
+        data.insert("status".into(), serde_json::json!("active"));
+        data.insert("status_context".into(), serde_json::json!("running"));
+        data.insert("status_time".into(), serde_json::json!(now_epoch_i64() - 100_000));
+        data.insert("created_at".into(), serde_json::json!(now_epoch_f64() - 100_000.0));
+        data.insert("pid".into(), serde_json::json!(pid));
+        db.save_instance_named("zombie", &data).unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+        assert_eq!(deleted, 0, "a live pid must be spared by the reaper");
+        assert!(
+            db.get_instance_full("zombie").unwrap().is_some(),
+            "the stale-but-alive row must survive"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup(path);
+    }
+
+    /// A stale row whose pid is DEAD is reaped exactly as before.
+    #[test]
+    fn test_cleanup_stale_instances_reaps_dead_pid() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i64;
+        child.wait().unwrap();
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("gone"));
+        data.insert("status".into(), serde_json::json!("active"));
+        data.insert("status_context".into(), serde_json::json!("running"));
+        data.insert("status_time".into(), serde_json::json!(now_epoch_i64() - 100_000));
+        data.insert("created_at".into(), serde_json::json!(now_epoch_f64() - 100_000.0));
+        data.insert("pid".into(), serde_json::json!(pid));
+        db.save_instance_named("gone", &data).unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+        assert_eq!(deleted, 1, "a stale row with a dead pid must still be reaped");
+        assert!(db.get_instance_full("gone").unwrap().is_none());
+
+        cleanup(path);
+    }
+
     fn test_cleanup_stale_placeholders_deletes_old() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
