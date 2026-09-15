@@ -945,6 +945,10 @@ Commands:\n\
 /// hatch (unsupported terminal emulators), not something to advertise.
 const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
+    (
+        "--instance-name <name>",
+        "Explicit instance name (single launch only)",
+    ),
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
     ("--headless", "Run in background"),
