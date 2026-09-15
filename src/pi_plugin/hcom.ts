@@ -354,7 +354,9 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		if (instanceName) {
-			await hcom(["pi-stop", "--name", instanceName, "--reason", event.reason ?? "shutdown"]);
+			await hcom(sessionId
+				? ["pi-stop", "--name", instanceName, "--reason", event.reason ?? "shutdown", "--session-id", sessionId]
+				: ["pi-stop", "--name", instanceName, "--reason", event.reason ?? "shutdown"]);
 		}
 		resetBinding();
 	});

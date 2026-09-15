@@ -408,6 +408,86 @@ fn start_handler_uses_central_binding_for_existing_session() {
 }
 
 #[test]
+fn stop_with_session_id_gates_foreign_session() {
+    let (db, path) = setup_test_db();
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, created_at, tool, session_id, status_context, status_time)
+             VALUES ('luna', 'listening', ?1, 'omp', 'sid-owner', '', 0)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+
+    let (code, output) = handle_stop(
+        &db,
+        &[
+            "--name".to_string(),
+            "luna".to_string(),
+            "--reason".to_string(),
+            "shutdown".to_string(),
+            "--session-id".to_string(),
+            "sid-foreign".to_string(),
+            "--soft".to_string(),
+        ],
+    );
+
+    assert_eq!(code, 0);
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(response.get("ok").and_then(|v| v.as_bool()), Some(true));
+    let row = db.get_instance_full("luna").unwrap().unwrap();
+    assert_ne!(
+        row.status,
+        crate::shared::ST_INACTIVE,
+        "a foreign session's omp-stop must not mark the owner's row inactive"
+    );
+    assert_eq!(
+        db.get_session_binding("sid-owner").unwrap(),
+        None,
+        "no binding may be cleared by a foreign session's stop"
+    );
+
+    cleanup(path);
+}
+
+#[test]
+fn stop_with_own_session_id_tears_down() {
+    let (db, path) = setup_test_db();
+    let now = chrono::Utc::now().timestamp() as f64;
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, status, created_at, tool, session_id, status_context, status_time)
+             VALUES ('luna', 'listening', ?1, 'omp', 'sid-owner', '', 0)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+    db.set_session_binding("sid-owner", "luna").unwrap();
+
+    let (code, _) = handle_stop(
+        &db,
+        &[
+            "--name".to_string(),
+            "luna".to_string(),
+            "--reason".to_string(),
+            "shutdown".to_string(),
+            "--session-id".to_string(),
+            "sid-owner".to_string(),
+            "--soft".to_string(),
+        ],
+    );
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        db.get_status("luna").unwrap().map(|(s, _)| s),
+        Some(crate::shared::ST_INACTIVE.to_string()),
+        "the owning session's omp-stop must proceed"
+    );
+    assert_eq!(db.get_session_binding("sid-owner").unwrap(), None);
+
+    cleanup(path);
+}
+
+#[test]
 fn soft_stop_keeps_instance_row_and_process_binding() {
     let (db, path) = setup_test_db();
     let now = chrono::Utc::now().timestamp() as f64;

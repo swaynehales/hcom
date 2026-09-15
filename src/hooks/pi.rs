@@ -564,4 +564,56 @@ mod tests {
 
         cleanup(path);
     }
+
+    #[test]
+    fn stop_with_session_id_gates_foreign_session() {
+        let (db, path) = setup_test_db();
+        save_test_instance(&db, "miso", ST_ACTIVE);
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'sid-owner' WHERE name = 'miso'",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sid-owner", "miso").unwrap();
+
+        let foreign = handle_stop(
+            &db,
+            &[
+                "--name".to_string(),
+                "miso".to_string(),
+                "--reason".to_string(),
+                "shutdown".to_string(),
+                "--session-id".to_string(),
+                "sid-foreign".to_string(),
+            ],
+        );
+        assert_eq!(foreign.0, 0);
+        let row = db.get_instance_full("miso").unwrap().unwrap();
+        assert_ne!(
+            row.status,
+            crate::shared::ST_INACTIVE,
+            "a foreign session's pi-stop must not mark the owner's row inactive"
+        );
+        assert_eq!(db.get_session_binding("sid-owner").unwrap(), Some("miso".into()));
+
+        let owner = handle_stop(
+            &db,
+            &[
+                "--name".to_string(),
+                "miso".to_string(),
+                "--reason".to_string(),
+                "shutdown".to_string(),
+                "--session-id".to_string(),
+                "sid-owner".to_string(),
+            ],
+        );
+        assert_eq!(owner.0, 0);
+        assert!(
+            db.get_instance_full("miso").unwrap().is_none(),
+            "the owning session's pi-stop must tear the row down"
+        );
+
+        cleanup(path);
+    }
 }

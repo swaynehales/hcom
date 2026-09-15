@@ -1167,6 +1167,11 @@ pub(crate) fn session_gate_allows(
     };
     match db.get_instance_full(instance_name) {
         Ok(Some(row)) => {
+            if row.session_id.is_none() {
+                // A row whose SessionStart never bound it has nothing to match
+                // against — ordinary teardown proceeds (legacy behavior).
+                return true;
+            }
             if row.session_id.as_deref() != Some(sid) {
                 log::log_warn(
                     "hooks",
@@ -1638,6 +1643,10 @@ pub(crate) fn session_gate_allows_inner(
     let Some(sid) = ending_session_id.filter(|s| !s.is_empty()) else {
         return true;
     };
+    if row.session_id.is_none() {
+        // Never-bound row: nothing to match against, teardown proceeds.
+        return true;
+    }
     if row.session_id.as_deref() != Some(sid) {
         log::log_warn(
             "hooks",
@@ -2951,6 +2960,26 @@ mod tests {
         let outcome = stop_instance_for_session(&db, "luna", "test", "reason", Some("sess-1"));
         assert_eq!(outcome, StopOutcome::Stopped);
         assert!(db.get_instance_full("luna").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_finalize_session_gated_null_session_row_still_tears_down() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('luna', 'claude', 'active', 'running', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        finalize_session_gated(&db, "luna", "user_quit", None, Some("sess-any"));
+
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "a never-bound row (NULL session id) must tear down on its own exit"
+        );
     }
 
     #[test]

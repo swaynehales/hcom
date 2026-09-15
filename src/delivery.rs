@@ -3114,6 +3114,10 @@ fn session_exit_gate_allows(db: &HcomDb, current_name: &str, process_id: &str) -
     };
     match db.get_instance_full(current_name) {
         Ok(Some(row)) => {
+            if row.session_id.is_none() {
+                // Never-bound row: nothing to match against, teardown proceeds.
+                return true;
+            }
             if row.session_id.as_deref() != Some(sid) {
                 log_warn(
                     "native",
