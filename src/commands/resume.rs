@@ -25,7 +25,10 @@ use crate::transcript::claude_projects_dir;
 /// Where to load the resume/fork plan from.
 enum ResumeSource<'a> {
     /// Resume an hcom-tracked instance by name (active or stopped).
-    Instance { name: &'a str },
+    Instance {
+        name: &'a str,
+        session_id: Option<&'a str>,
+    },
     /// Adopt a session from its on-disk transcript (first-time bring-in under hcom).
     Disk {
         session_id: String,
@@ -249,11 +252,13 @@ fn resolve_name_to_plan(
 ) -> Result<(String, PreparedResume)> {
     let mut current = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
+    let mut target_session_id: Option<String> = None;
 
     // A loop over reclaim hops (binding → events → redirect to instance name).
     // Bounded by MAX_HOPS in case of pathological DB state.
     for _ in 0..8 {
         if is_session_id(&current) {
+            target_session_id = Some(current.clone());
             if let Ok(Some(bound)) = db.get_session_binding(&current)
                 && matches!(db.get_instance_full(&bound), Ok(Some(_)))
             {
@@ -277,6 +282,7 @@ fn resolve_name_to_plan(
             && crate::relay::control::split_device_suffix(&current).is_none()
             && let Some(session_id) = resolve_thread_name(&current)?
         {
+            target_session_id = Some(session_id.clone());
             if let Ok(Some(bound)) = db.get_session_binding(&session_id)
                 && matches!(db.get_instance_full(&bound), Ok(Some(_)))
             {
@@ -297,7 +303,14 @@ fn resolve_name_to_plan(
             return Ok((session_id, plan));
         }
 
-        let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
+        let plan = prepare_resume_plan_with_session(
+            db,
+            &current,
+            target_session_id.as_deref(),
+            fork,
+            extra_args,
+            flags,
+        )?;
         return Ok((current, plan));
     }
 
@@ -314,7 +327,24 @@ fn prepare_resume_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
-    prepare_resume_plan_from_source(db, ResumeSource::Instance { name }, fork, extra_args, flags)
+    prepare_resume_plan_with_session(db, name, None, fork, extra_args, flags)
+}
+
+fn prepare_resume_plan_with_session(
+    db: &HcomDb,
+    name: &str,
+    session_id: Option<&str>,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<PreparedResume> {
+    prepare_resume_plan_from_source(
+        db,
+        ResumeSource::Instance { name, session_id },
+        fork,
+        extra_args,
+        flags,
+    )
 }
 
 fn prepare_resume_plan_from_source(
@@ -338,7 +368,10 @@ fn prepare_resume_plan_from_source(
         snapshot_dir,
         display_name,
     ) = match source {
-        ResumeSource::Instance { name } => {
+        ResumeSource::Instance {
+            name,
+            session_id: target_session_id,
+        } => {
             if !fork
                 && let Ok(Some(inst)) = db.get_instance_full(name)
                 && inst.status != ST_INACTIVE
@@ -346,9 +379,9 @@ fn prepare_resume_plan_from_source(
                 bail!("'{}' is still active — run hcom kill {} first", name, name);
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
-                load_instance_data(db, name)?
+                load_instance_data(db, name, target_session_id)?
             } else {
-                load_stopped_snapshot(db, name)?
+                load_stopped_snapshot(db, name, target_session_id)?
             };
             (tool, sid, largs, tag, bg, leid, snap, name.to_string())
         }
@@ -888,50 +921,84 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&
 fn load_instance_data(
     db: &HcomDb,
     name: &str,
+    session_id: Option<&str>,
 ) -> Result<(String, String, String, String, bool, i64, String)> {
     // Try active instance first
     if let Ok(Some(inst)) = db.get_instance_full(name) {
-        return Ok((
-            inst.tool.clone(),
-            inst.session_id.as_deref().unwrap_or("").to_string(),
-            inst.launch_args.as_deref().unwrap_or("").to_string(),
-            inst.tag.as_deref().unwrap_or("").to_string(),
-            inst.background != 0,
-            inst.last_event_id,
-            inst.directory.clone(),
-        ));
+        if session_id.is_none() || inst.session_id.as_deref() == session_id {
+            return Ok((
+                inst.tool.clone(),
+                inst.session_id.as_deref().unwrap_or("").to_string(),
+                inst.launch_args.as_deref().unwrap_or("").to_string(),
+                inst.tag.as_deref().unwrap_or("").to_string(),
+                inst.background != 0,
+                inst.last_event_id,
+                inst.directory.clone(),
+            ));
+        }
     }
 
     // Fall back to stopped snapshot
-    load_stopped_snapshot(db, name)
+    load_stopped_snapshot(db, name, session_id)
 }
 
 /// Load stopped snapshot from life events.
 fn load_stopped_snapshot(
     db: &HcomDb,
     name: &str,
+    session_id: Option<&str>,
 ) -> Result<(String, String, String, String, bool, i64, String)> {
     // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
     // (old 10-row LIMIT could drop the snapshot after many relaunches).
-    let mut stmt = db.conn().prepare(
-        "SELECT data FROM events
-         WHERE type='life'
-           AND instance=?
-           AND json_extract(data, '$.action') = 'stopped'
-         ORDER BY id DESC LIMIT 1",
-    )?;
-
-    let rows: Vec<String> = stmt
-        .query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
+    let rows: Vec<String> = if let Some(sid) = session_id {
+        let mut stmt = db.conn().prepare(
+            "SELECT data FROM events
+             WHERE type='life'
+               AND instance=?
+               AND json_extract(data, '$.action') = 'stopped'
+               AND (json_extract(data, '$.snapshot.session_id') = ?
+                    OR json_extract(data, '$.session_id') = ?)
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        stmt.query_map(rusqlite::params![name, sid, sid], |row| {
+            row.get::<_, String>(0)
+        })?
         .filter_map(|r| r.ok())
-        .collect();
+        .collect()
+    } else {
+        let mut stmt = db.conn().prepare(
+            "SELECT data FROM events
+             WHERE type='life'
+               AND instance=?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        stmt.query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
 
     for data_str in &rows {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
             && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
-            && let Some(snapshot) = data.get("snapshot")
         {
-            let tool = snapshot
+            if let Some(renamed_to) = data
+                .get("renamed_to")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    data.get("snapshot")
+                        .and_then(|s| s.get("renamed_to"))
+                        .and_then(|v| v.as_str())
+                })
+            {
+                bail!(
+                    "this name moved to {} — resume {} or hcom r {}",
+                    renamed_to, renamed_to, renamed_to
+                );
+            }
+
+            if let Some(snapshot) = data.get("snapshot") {
+                let tool = snapshot
                 .get("tool")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
@@ -976,6 +1043,7 @@ fn load_stopped_snapshot(
                 directory,
             ));
         }
+    }
     }
 
     bail!(
@@ -3629,5 +3697,126 @@ mod tests {
             None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
         }
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resume_selection_selects_matching_session_id_after_succession() {
+        let db = test_db();
+        let pred_dir = tempfile::tempdir().unwrap();
+        let succ_dir = tempfile::tempdir().unwrap();
+
+        let pred_sid = "11111111-1111-1111-1111-111111111111";
+        let succ_sid = "22222222-2222-2222-2222-222222222222";
+
+        // Predecessor "1111..." ran as "luna" and stopped.
+        let pred_tombstone = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "claude",
+                "session_id": pred_sid,
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 10,
+                "directory": pred_dir.path().to_str().unwrap()
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, timestamp, type, instance, data) VALUES (1, '2026-01-01T00:00:00Z', 'life', 'luna', ?)",
+                rusqlite::params![pred_tombstone.to_string()],
+            )
+            .unwrap();
+
+        // Successor "2222..." succeeded "luna" and later stopped.
+        let succ_tombstone = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "claude",
+                "session_id": succ_sid,
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 20,
+                "directory": succ_dir.path().to_str().unwrap()
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, timestamp, type, instance, data) VALUES (2, '2026-01-01T01:00:00Z', 'life', 'luna', ?)",
+                rusqlite::params![succ_tombstone.to_string()],
+            )
+            .unwrap();
+
+        // Resuming predecessor by its session_id MUST select the predecessor's tombstone (pred_sid),
+        // NOT the successor's latest tombstone (succ_sid).
+        let (resolved, plan) =
+            match resolve_name_to_plan(&db, pred_sid, false, &[], &GlobalFlags::default()) {
+                Ok(v) => v,
+                Err(e) => panic!("should resolve and prepare plan for predecessor: {e}"),
+            };
+
+        assert_eq!(resolved, "luna");
+        assert_eq!(plan.session_id, pred_sid);
+        assert_eq!(plan.last_event_id, 10);
+        assert_eq!(
+            plan.launch.cwd.as_deref(),
+            Some(pred_dir.path().to_str().unwrap())
+        );
+
+        // Resuming successor by its session_id selects the successor's tombstone.
+        let (resolved2, plan2) =
+            match resolve_name_to_plan(&db, succ_sid, false, &[], &GlobalFlags::default()) {
+                Ok(v) => v,
+                Err(e) => panic!("should resolve and prepare plan for successor: {e}"),
+            };
+
+        assert_eq!(resolved2, "luna");
+        assert_eq!(plan2.session_id, succ_sid);
+        assert_eq!(plan2.last_event_id, 20);
+        assert_eq!(
+            plan2.launch.cwd.as_deref(),
+            Some(succ_dir.path().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resume_refuses_tombstone_with_renamed_to() {
+        let db = test_db();
+
+        // An instance "luna" that was renamed to "sol" has a rename tombstone with renamed_to
+        let rename_tombstone = serde_json::json!({
+            "action": "stopped",
+            "by": "start --as",
+            "reason": "renamed",
+            "renamed_to": "sol",
+            "session_id": serde_json::Value::Null,
+            "snapshot": {
+                "tool": "claude",
+                "session_id": "sess-luna",
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 5,
+                "directory": "/tmp"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES ('2026-01-01T00:00:00Z', 'life', 'luna', ?)",
+                rusqlite::params![rename_tombstone.to_string()],
+            )
+            .unwrap();
+
+        // Resuming "luna" must refuse with the exact message
+        match prepare_resume_plan(&db, "luna", false, &[], &GlobalFlags::default()) {
+            Ok(_) => panic!("resuming renamed instance must fail"),
+            Err(err) => {
+                assert_eq!(
+                    err.to_string(),
+                    "this name moved to sol — resume sol or hcom r sol"
+                );
+            }
+        }
     }
 }
