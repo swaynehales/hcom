@@ -195,7 +195,13 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launcher: Some(launcher_name.clone()),
             run_here: hcom_flags.run_here,
             batch_id: hcom_flags.batch_id,
-            name: None, // --name is caller identity, not instance name
+            name: if let Some(ref raw_name) = hcom_flags.instance_name {
+                let valid_name = crate::identity::validate_claim_name(&db, raw_name)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Some(valid_name)
+            } else {
+                None
+            },
             skip_validation: false,
             terminal,
             append_reply_handoff: true,
@@ -440,6 +446,7 @@ pub(crate) struct HcomLaunchFlags {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
+    pub instance_name: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -602,7 +609,16 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--instance-name=") {
+            flags.instance_name = Some(args[i][16..].to_string());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
+            "--instance-name" if i + 1 < args.len() => {
+                flags.instance_name = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
                 i += 2;

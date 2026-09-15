@@ -1774,6 +1774,8 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.count
             );
         }
+        crate::identity::validate_claim_name(db, name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         resolve_explicit_name_conflict(db, name)?;
     }
 
