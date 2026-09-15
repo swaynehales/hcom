@@ -378,9 +378,15 @@ fn start_rebind(
 ) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
-    // Resolve the target name
-    let target_name = identity::resolve_display_name_or_stopped(db, rebind_target)
-        .unwrap_or_else(|| rebind_target.to_string());
+    // D5: validate the requested name on every claim entry point; the Ok
+    // value is the resolved base name, so it is the name claimed.
+    let target_name = match identity::validate_claim_name(db, rebind_target) {
+        Ok(name) => name,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            return Ok(1);
+        }
+    };
 
     // Guard: refuse to reclaim a subagent slot. Subagents share their parent's
     // session_id, so `hcom start --as <subagent_name>` from inside a subagent
@@ -1115,6 +1121,199 @@ mod tests {
         let args = StartArgs::try_parse_from(["start"]).unwrap();
         assert!(args.orphan.is_none());
         assert!(args.as_name.is_none());
+    }
+
+    fn insert_claim_target(
+        db: &HcomDb,
+        name: &str,
+        pid: Option<i64>,
+        status_time: i64,
+        directory: &str,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at,
+                  last_seen, directory, background, pid, last_event_id)
+                 VALUES (?1, NULL, 'claude', 'active', 'running', ?2, 1, 0, ?3, 1, ?4, 7)",
+                rusqlite::params![name, status_time, directory, pid],
+            )
+            .unwrap();
+    }
+
+    fn spawn_live_pid() -> (std::process::Child, i64) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep for live-pid test");
+        let pid = child.id() as i64;
+        (child, pid)
+    }
+
+    fn tombstone_count(db: &HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = ? AND data LIKE '%\"action\":\"stopped\"%'",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn test_d3_live_pid_stale_row_refuses_claim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let (mut child, pid) = spawn_live_pid();
+        let cwd = "/tmp/nrm053-d3-live";
+        std::fs::create_dir_all(cwd).unwrap();
+        insert_claim_target(&db, "nova", Some(pid), crate::shared::time::now_epoch_i64() - 1000, cwd);
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+
+        assert_eq!(result, 1, "a stale row with a live pid must refuse the claim");
+        assert!(
+            db.get_instance_full("nova").unwrap().is_some(),
+            "the live row must survive the refused claim"
+        );
+        assert_eq!(
+            tombstone_count(&db, "nova"),
+            0,
+            "a refused claim must publish no tombstone"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[serial]
+    fn test_d3_dead_pid_stale_row_claim_succeeds() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let pid = dead.id() as i64;
+        dead.wait().unwrap();
+        let cwd = "/tmp/nrm053-d3-dead";
+        std::fs::create_dir_all(cwd).unwrap();
+        insert_claim_target(&db, "nova", Some(pid), crate::shared::time::now_epoch_i64() - 1000, cwd);
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+
+        assert_eq!(result, 0, "a stale row with a dead pid is a valid succession");
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("sess-claim"));
+        assert_eq!(
+            db.get_session_binding("sess-claim").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert_eq!(
+            tombstone_count(&db, "nova"),
+            1,
+            "the predecessor stop must publish exactly one tombstone"
+        );
+        assert_eq!(
+            row.last_event_id, 7,
+            "the succession must carry the predecessor's cursor"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_d3_active_row_refuses_claim() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-d3-active";
+        std::fs::create_dir_all(cwd).unwrap();
+        insert_claim_target(
+            &db,
+            "nova",
+            None,
+            crate::shared::time::now_epoch_i64(),
+            cwd,
+        );
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+
+        assert_eq!(result, 1, "a fresh active row must refuse the claim");
+        assert!(db.get_instance_full("nova").unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_d3_own_session_live_row_updates_in_place() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-d3-own";
+        std::fs::create_dir_all(cwd).unwrap();
+        insert_claim_target(
+            &db,
+            "nova",
+            None,
+            crate::shared::time::now_epoch_i64(),
+            cwd,
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'sess-claim' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('sess-claim', 'nova', 1)",
+                [],
+            )
+            .unwrap();
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind(&db, "nova", &ctx, None).unwrap();
+
+        assert_eq!(result, 0, "the compaction re-run reclaims its own live row");
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status, "active", "the own row's status must not reset");
+        assert_eq!(
+            row.created_at, 1.0,
+            "the own row's incarnation must be preserved"
+        );
+        assert_eq!(tombstone_count(&db, "nova"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_d5_start_as_refuses_reserved_and_invalid_names() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            "/tmp/nrm053-d5",
+        );
+
+        for bad in ["bigboss", "hcom", "Bad Name", "has-dash"] {
+            let result = start_rebind(&db, bad, &ctx, None).unwrap();
+            assert_eq!(result, 1, "'{bad}' must be refused by validate_claim_name");
+        }
+        assert!(
+            db.iter_instances_full().unwrap().is_empty(),
+            "refused claims must create no rows"
+        );
     }
 
     #[test]
