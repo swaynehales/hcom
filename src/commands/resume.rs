@@ -331,16 +331,6 @@ fn resolve_name_to_plan(
     );
 }
 
-fn prepare_resume_plan(
-    db: &HcomDb,
-    name: &str,
-    fork: bool,
-    extra_args: &[String],
-    flags: &GlobalFlags,
-) -> Result<PreparedResume> {
-    prepare_resume_plan_with_session(db, name, None, fork, extra_args, flags)
-}
-
 fn prepare_resume_plan_with_session(
     db: &HcomDb,
     name: &str,
@@ -2932,7 +2922,8 @@ mod tests {
             .unwrap();
 
         // Should NOT bail — inactive agy row is resumable.
-        let result = prepare_resume_plan(&db, "zeno", false, &[], &GlobalFlags::default());
+        let result =
+            prepare_resume_plan_with_session(&db, "zeno", None, false, &[], &GlobalFlags::default());
         assert!(
             result.is_ok(),
             "expected inactive agy row to be resumable, got: {:?}",
@@ -3179,7 +3170,9 @@ mod tests {
         db.save_instance_named("luna", &data).unwrap();
 
         let before_count = db.iter_instances_full().unwrap().len();
-        let plan = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        let plan =
+            prepare_resume_plan_with_session(&db, "luna", None, true, &[], &GlobalFlags::default())
+                .unwrap();
         let preview_name = plan
             .launch
             .name
@@ -3234,7 +3227,9 @@ mod tests {
             )
             .unwrap();
 
-        let resume = prepare_resume_plan(&db, "luna", false, &[], &GlobalFlags::default()).unwrap();
+        let resume =
+            prepare_resume_plan_with_session(&db, "luna", None, false, &[], &GlobalFlags::default())
+                .unwrap();
         assert_eq!(
             resume.launch.prior_session_id.as_deref(),
             Some("session-123"),
@@ -3242,7 +3237,9 @@ mod tests {
              so a kill before the first turn (no hook re-bind) stays resumable"
         );
 
-        let fork = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        let fork =
+            prepare_resume_plan_with_session(&db, "luna", None, true, &[], &GlobalFlags::default())
+                .unwrap();
         assert_eq!(
             fork.launch.prior_session_id, None,
             "forks bind a fresh session on first turn; must not inherit the parent's"
@@ -3820,7 +3817,7 @@ mod tests {
             .unwrap();
 
         // Resuming "luna" must refuse with the exact message
-        match prepare_resume_plan(&db, "luna", false, &[], &GlobalFlags::default()) {
+        match prepare_resume_plan_with_session(&db, "luna", None, false, &[], &GlobalFlags::default()) {
             Ok(_) => panic!("resuming renamed instance must fail"),
             Err(err) => {
                 assert_eq!(
