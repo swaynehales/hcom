@@ -10,11 +10,28 @@ use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log::{log_error, log_info};
+use crate::shared::ST_INACTIVE;
 use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 
 use super::common;
-use super::common::finalize_session;
+use super::common::finalize_session_gated;
+
+/// Check whether an instance is considered live: computed status is not inactive,
+/// or its PID is still running.
+fn is_instance_live(db: &HcomDb, row: &crate::db::InstanceRow) -> bool {
+    let computed = lifecycle::get_instance_status(row, db);
+    if computed.status != ST_INACTIVE {
+        return true;
+    }
+    if let Some(pid) = row.pid
+        && pid > 0
+        && crate::sys::process::is_alive(pid as u32)
+    {
+        return true;
+    }
+    false
+}
 
 /// Extract `--flag value` from argv. Returns None if not found.
 fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
@@ -142,13 +159,43 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
 
     let notify_port: Option<u16> = parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
 
-    let process_id = match &ctx.process_id {
-        Some(pid) => pid.clone(),
-        None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
-    };
-
-    // Re-binding detection: session already bound (compaction or reconnect)
+    // Re-binding detection: session already bound (compaction, reconnect, or bare resume)
     if let Ok(Some(existing_name)) = db.get_session_binding(&session_id) {
+        if let Ok(Some(row)) = db.get_instance_full(&existing_name) {
+            if is_instance_live(db, &row) {
+                let matching_process = ctx
+                    .process_id
+                    .as_deref()
+                    .and_then(|pid| db.get_process_binding(pid).ok().flatten())
+                    .as_deref()
+                    == Some(&existing_name);
+
+                if !matching_process {
+                    log_error(
+                        "hooks",
+                        "opencode-start.live_rebind_denied",
+                        &format!(
+                            "Cannot adopt live instance without matching process binding: instance={} session_id={}",
+                            existing_name, session_id
+                        ),
+                    );
+                    return (
+                        0,
+                        r#"{"error":"Cannot adopt live instance without matching process binding"}"#.to_string(),
+                    );
+                }
+            }
+        }
+
+        if let Some(pid) = &ctx.process_id {
+            if let Err(e) = db.set_process_binding(pid, &session_id, &existing_name) {
+                log_error(
+                    "hooks",
+                    "hook.error",
+                    &format!("hook=opencode-start op=set_process_binding err={}", e),
+                );
+            }
+        }
         let tool = instance_tool(db, &existing_name);
         let mut rebind_updates = serde_json::Map::new();
         rebind_updates.insert("name_announced".into(), serde_json::json!(false));
@@ -205,6 +252,11 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         }
         return (0, serde_json::to_string(&result).unwrap_or_default());
     }
+
+    let process_id = match &ctx.process_id {
+        Some(pid) => pid.clone(),
+        None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
+    };
 
     // Normal binding path
     let instance_name =
@@ -449,15 +501,16 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
 /// Handle opencode-stop: finalize session and clean up instance.
 ///
 /// Called by OpenCode plugin on session.deleted event.
-/// Expects: hcom opencode-stop --name <name> [--reason <reason>]
+/// Expects: hcom opencode-stop --name <name> [--session-id <sid>] [--reason <reason>]
 fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
     let name = match parse_flag(argv, "--name") {
         Some(n) => n,
         None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
     };
     let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
+    let session_id = parse_flag(argv, "--session-id");
 
-    finalize_session(db, &name, &reason, None);
+    finalize_session_gated(db, &name, &reason, None, session_id.as_deref());
 
     (0, r#"{"ok":true}"#.to_string())
 }
@@ -1120,6 +1173,7 @@ mod tests {
             )
             .unwrap();
         db.set_session_binding("sess-1", "luna").unwrap();
+        db.set_process_binding("pid-123", "sess-1", "luna").unwrap();
 
         let env = std::collections::HashMap::from([
             (
@@ -1347,5 +1401,163 @@ mod tests {
         let (code, output) = handle_stop(&db, &sv(&[]));
         assert_eq!(code, 0);
         assert!(output.contains("Missing --name"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_start_non_live_adopt_without_process_id_succeeds() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+
+        // Inactive instance (non-live)
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_time, created_at)
+                 VALUES ('luna', 'opencode', 'inactive', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "luna").unwrap();
+
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        assert!(ctx.process_id.is_none());
+
+        let (code, output) = handle_start(&ctx, &db, &sv(&["--session-id", "sess-1"]));
+        assert_eq!(code, 0);
+
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["name"], "luna");
+        assert_eq!(payload["session_id"], "sess-1");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_start_live_adopt_without_matching_process_binding_fails() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+
+        let now = crate::shared::time::now_epoch_i64();
+        // Live instance (active with fresh status_time)
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_time, created_at)
+                 VALUES ('luna', 'opencode', 'active', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "luna").unwrap();
+
+        // 1. Bare adopt with no HCOM_PROCESS_ID
+        let env_bare = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+        ]);
+        let ctx_bare = HcomContext::from_env(&env_bare, std::path::PathBuf::from("/tmp"));
+        let (code, output) = handle_start(&ctx_bare, &db, &sv(&["--session-id", "sess-1"]));
+        assert_eq!(code, 0);
+        assert!(
+            output.contains("Cannot adopt live instance without matching process binding"),
+            "bare adopt on live instance must be refused: {output}"
+        );
+
+        // 2. Foreign process id with no matching binding
+        let env_foreign = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-foreign".to_string()),
+        ]);
+        let ctx_foreign = HcomContext::from_env(&env_foreign, std::path::PathBuf::from("/tmp"));
+        let (code, output) = handle_start(&ctx_foreign, &db, &sv(&["--session-id", "sess-1"]));
+        assert_eq!(code, 0);
+        assert!(
+            output.contains("Cannot adopt live instance without matching process binding"),
+            "foreign process adopt on live instance must be refused: {output}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_handle_start_live_adopt_with_matching_process_binding_succeeds() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+
+        let now = crate::shared::time::now_epoch_i64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_time, created_at)
+                 VALUES ('luna', 'opencode', 'active', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "luna").unwrap();
+        db.set_process_binding("pid-match", "sess-1", "luna").unwrap();
+
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-match".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let (code, output) = handle_start(&ctx, &db, &sv(&["--session-id", "sess-1"]));
+        assert_eq!(code, 0);
+
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["name"], "luna");
+        assert_eq!(payload["session_id"], "sess-1");
+    }
+
+    #[test]
+    fn test_handle_stop_passes_ending_session_to_the_gate() {
+        let (_dir, db) = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('luna', 'sess-1', 'opencode', 'active', 'running', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        let argv_foreign = sv(&["--name", "luna", "--session-id", "sess-other", "--reason", "closed"]);
+        let (code, _) = handle_stop(&db, &argv_foreign);
+        assert_eq!(code, 0);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.status, "active",
+            "a foreign session's stop must not mark the row inactive"
+        );
+
+        let argv_own = sv(&["--name", "luna", "--session-id", "sess-1", "--reason", "closed"]);
+        let (code, _) = handle_stop(&db, &argv_own);
+        assert_eq!(code, 0);
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "the owning session's stop must tear the row down"
+        );
     }
 }

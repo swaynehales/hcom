@@ -394,7 +394,6 @@ export const HcomPlugin: Plugin = async ({ client, $, directory }: { client: any
 
   async function bindIdentity(sid: string): Promise<void> {
     if (instanceName || bindingPromise) return
-    if (process.env.HCOM_LAUNCHED !== "1") return
 
     bindingPromise = (async () => {
       try {
@@ -520,7 +519,11 @@ export const HcomPlugin: Plugin = async ({ client, $, directory }: { client: any
             stopNotifyServer()
             stopReconcileTimer()
             if (instanceName) {
-              await $.nothrow()`hcom opencode-stop --name ${instanceName} --reason closed`.quiet()
+              if (sessionId) {
+                await $.nothrow()`hcom opencode-stop --name ${instanceName} --session-id ${sessionId} --reason closed`.quiet()
+              } else {
+                await $.nothrow()`hcom opencode-stop --name ${instanceName} --reason closed`.quiet()
+              }
             }
             instanceName = null
             sessionId = null
