@@ -137,7 +137,18 @@ pub fn do_resume(
         if ctx.is_inside_ai_tool()
             && !flags.go
             && should_preview_resume_rpc(extra_args)
-            && let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags)
+            && let Ok(plan) = prepare_resume_plan_with_session(
+                &db,
+                base_name,
+                if is_session_id(base_name) {
+                    Some(base_name)
+                } else {
+                    None
+                },
+                fork,
+                extra_args,
+                flags,
+            )
         {
             print_resume_preview(&plan, &hcom_config, &name, fork);
             return Ok(0);
