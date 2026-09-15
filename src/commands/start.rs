@@ -389,15 +389,6 @@ fn row_is_remote(row: &InstanceRow) -> bool {
 
 /// Rebind session identity (`--as <name>`), preserving last_event_id and any
 /// live Claude child hierarchy owned by the current root actor.
-fn start_rebind(
-    db: &HcomDb,
-    rebind_target: &str,
-    ctx: &HcomContext,
-    explicit_name: Option<&str>,
-) -> Result<i32> {
-    start_rebind_opts(db, rebind_target, ctx, explicit_name, ClaimOptions::default())
-}
-
 fn start_rebind_opts(
     db: &HcomDb,
     rebind_target: &str,
@@ -1472,7 +1463,7 @@ mod tests {
         );
 
         for bad in ["bigboss", "hcom", "Bad Name", "has-dash"] {
-            let result = start_rebind(&db, bad, &ctx, None).unwrap();
+            let result = start_rebind_opts(&db, bad, &ctx, None, ClaimOptions::default()).unwrap();
             assert_eq!(result, 1, "'{bad}' must be refused by validate_claim_name");
         }
         assert!(
@@ -1863,7 +1854,10 @@ mod tests {
             .unwrap();
 
         let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
-        assert_eq!(start_rebind(&db, "nova", &ctx, Some("nova")).unwrap(), 0);
+        assert_eq!(
+            start_rebind_opts(&db, "nova", &ctx, Some("nova"), ClaimOptions::default()).unwrap(),
+            0
+        );
 
         let child = db.get_instance_full("nova_task_1").unwrap().unwrap();
         assert_eq!(child.parent_session_id.as_deref(), Some("sess-1"));
@@ -1895,7 +1889,7 @@ mod tests {
             "/tmp/hcom-gan-harness/.worktrees/bench-infra",
         );
 
-        let err = start_rebind(&db, "fama", &ctx, None).unwrap_err();
+        let err = start_rebind_opts(&db, "fama", &ctx, None, ClaimOptions::default()).unwrap_err();
         assert!(
             err.to_string().contains("Refusing to reclaim 'fama'"),
             "unexpected error: {err}"
@@ -1925,7 +1919,7 @@ mod tests {
             "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
         );
 
-        let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let exit_code = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions::default()).unwrap();
         assert_eq!(exit_code, 0);
 
         let inst = db.get_instance_full("nova").unwrap().unwrap();
@@ -1957,7 +1951,7 @@ mod tests {
             "/tmp/hcom-gan-harness/.worktrees/bench-infra",
         );
 
-        let err = start_rebind(&db, "mira", &ctx, None).unwrap_err();
+        let err = start_rebind_opts(&db, "mira", &ctx, None, ClaimOptions::default()).unwrap_err();
         assert!(
             err.to_string().contains("Refusing to reclaim 'mira'"),
             "unexpected error: {err}"
