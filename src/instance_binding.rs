@@ -1219,7 +1219,7 @@ fn auto_subscribe_eligible(tool: &str) -> bool {
         .is_ok_and(|tool| tool.spec().released)
 }
 
-fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
+pub fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
     if !auto_subscribe_eligible(tool) {
         return;
     }
