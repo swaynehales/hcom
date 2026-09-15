@@ -46,6 +46,41 @@ pub fn base_name_error(name: &str) -> String {
     )
 }
 
+/// Validate an instance name being claimed via `hcom start --as` or `hcom [tool] --instance-name`.
+///
+/// Refuses:
+/// - `bigboss` (`crate::shared::constants::SENDER`)
+/// - `hcom` (`crate::shared::constants::SYSTEM_SENDER`)
+/// - names in `instance_names::banned_names()`
+/// - any name failing `^[a-z0-9_]+$`
+///
+/// Operates on the resolved base name (after `resolve_display_name_or_stopped`),
+/// so tagged inputs like `--as team-luna` resolve to `luna` and keep working.
+pub fn validate_claim_name(db: &HcomDb, raw_name: &str) -> Result<String, String> {
+    if raw_name.is_empty() {
+        return Err("Instance name cannot be empty".to_string());
+    }
+
+    let base =
+        resolve_display_name_or_stopped(db, raw_name).unwrap_or_else(|| raw_name.to_string());
+
+    if !BASE_NAME_RE.is_match(&base) {
+        return Err(format!(
+            "Invalid instance name '{raw_name}'. Use base name only (lowercase letters, numbers, underscore)."
+        ));
+    }
+
+    if base == crate::shared::constants::SENDER || base == crate::shared::constants::SYSTEM_SENDER {
+        return Err(format!("Cannot claim reserved name '{base}'"));
+    }
+
+    if crate::instance_names::banned_names().contains(base.as_str()) {
+        return Err(format!("Cannot claim reserved name '{base}'"));
+    }
+
+    Ok(base)
+}
+
 /// Generate actionable error message for instance not found.
 ///
 /// For subagent agent_ids, don't suggest `--as` (causes process binding conflicts).
@@ -962,5 +997,74 @@ mod tests {
             resolve_display_name_or_stopped(&db, "luna").as_deref(),
             Some("luna")
         );
+    }
+
+    #[test]
+    fn test_validate_claim_name() {
+        let (db, _dir) = make_test_db();
+
+        // Valid base names
+        assert_eq!(validate_claim_name(&db, "luna").unwrap(), "luna");
+        assert_eq!(
+            validate_claim_name(&db, "nurmterm_lead").unwrap(),
+            "nurmterm_lead"
+        );
+        assert_eq!(
+            validate_claim_name(&db, "agent_123").unwrap(),
+            "agent_123"
+        );
+
+        // Refuses bigboss and hcom
+        assert!(validate_claim_name(&db, "bigboss").is_err());
+        assert_eq!(
+            validate_claim_name(&db, "bigboss").unwrap_err(),
+            "Cannot claim reserved name 'bigboss'"
+        );
+        assert!(validate_claim_name(&db, "hcom").is_err());
+        assert_eq!(
+            validate_claim_name(&db, "hcom").unwrap_err(),
+            "Cannot claim reserved name 'hcom'"
+        );
+
+        // Refuses banned names
+        for banned in crate::instance_names::banned_names() {
+            assert!(validate_claim_name(&db, banned).is_err());
+            assert_eq!(
+                validate_claim_name(&db, banned).unwrap_err(),
+                format!("Cannot claim reserved name '{banned}'")
+            );
+        }
+
+        // Refuses invalid characters
+        assert!(validate_claim_name(&db, "LUNA").is_err());
+        assert!(validate_claim_name(&db, "luna-nova").is_err());
+        assert!(validate_claim_name(&db, "luna.nova").is_err());
+        assert!(validate_claim_name(&db, "luna@nova").is_err());
+        assert!(validate_claim_name(&db, "luna nova").is_err());
+        assert!(validate_claim_name(&db, "").is_err());
+
+        // Resolves display name: tagged instance in DB resolves to valid base name
+        insert_instance(&db, "nova", None, None);
+        db.conn()
+            .execute("UPDATE instances SET tag = 'team' WHERE name = 'nova'", [])
+            .unwrap();
+
+        assert_eq!(validate_claim_name(&db, "team-nova").unwrap(), "nova");
+
+        // Stopped tagged snapshot also resolves
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', 'kora', ?1)",
+                rusqlite::params![
+                    serde_json::json!({
+                        "action": "stopped",
+                        "snapshot": {"tag": "pod"}
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        assert_eq!(validate_claim_name(&db, "pod-kora").unwrap(), "kora");
     }
 }
