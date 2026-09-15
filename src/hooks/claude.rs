@@ -2126,7 +2126,7 @@ fn handle_sessionend(
         return (0, String::new());
     }
 
-    common::finalize_session(
+    common::finalize_session_gated(
         db,
         instance_name,
         reason,
@@ -2135,6 +2135,7 @@ fn handle_sessionend(
         } else {
             Some(updates)
         },
+        Some(session_id),
     );
 
     cleanup_sessionend_scoped_state(db, session_id);
@@ -6950,6 +6951,34 @@ mod tests {
             .unwrap(),
             Some("1".to_string()),
             "a different session's stop-claim keys must survive"
+        );
+    }
+
+    #[test]
+    fn test_sessionend_passes_ending_session_to_the_gate() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('luna', 'sess-1', 'claude', 'active', 'running', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        let (code, _) = handle_sessionend(&db, "luna", "sess-other", &serde_json::json!({"reason": "user_quit"}), &serde_json::Map::new());
+        assert_eq!(code, 0);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            row.status, "active",
+            "a foreign session's SessionEnd must not mark the row inactive"
+        );
+
+        let (code, _) = handle_sessionend(&db, "luna", "sess-1", &serde_json::json!({"reason": "user_quit"}), &serde_json::Map::new());
+        assert_eq!(code, 0);
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "the owning session's SessionEnd must tear the row down"
         );
     }
 }

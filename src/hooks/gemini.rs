@@ -660,9 +660,22 @@ fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     // that's about to take another turn. Real teardown is the PTY exit. Other gemini
     // tools have a genuine SessionEnd == process death, so they hard-finalize.
     if is_agy {
-        common::soft_finalize_session(db, &instance.name, &reason, None, false);
+        common::soft_finalize_session_gated(
+            db,
+            &instance.name,
+            &reason,
+            None,
+            false,
+            payload.session_id.as_deref(),
+        );
     } else {
-        common::finalize_session(db, &instance.name, &reason, None);
+        common::finalize_session_gated(
+            db,
+            &instance.name,
+            &reason,
+            None,
+            payload.session_id.as_deref(),
+        );
     }
 
     hook_noop()
