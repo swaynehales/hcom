@@ -352,7 +352,13 @@ pub(crate) fn handle_sessionend(
     // hook runs, so PID liveness cannot identify a resumable transition. A new
     // in-process session starts before the old SessionEnd and is protected by
     // the historical-session guard above.
-    common::finalize_session(db, instance_name, "sessionend", None);
+    common::finalize_session_gated(
+        db,
+        instance_name,
+        "sessionend",
+        None,
+        payload.session_id.as_deref(),
+    );
 
     hook_noop()
 }

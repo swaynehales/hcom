@@ -507,7 +507,13 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> V
             .or_else(|| payload.raw.get("stop_reason"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        common::finalize_session(db, &instance.name, reason, None);
+        common::finalize_session_gated(
+            db,
+            &instance.name,
+            reason,
+            None,
+            payload.session_id.as_deref(),
+        );
     }
     json!({})
 }
