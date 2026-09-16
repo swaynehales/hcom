@@ -13,6 +13,8 @@ pub enum VerifyFailReason {
     HookEventMissing(String),
     #[error("hcom hook command '{cmd_suffix}' not found under event '{event}'")]
     HookCommandMissing { event: String, cmd_suffix: String },
+    #[error("hcom hook commands carry a stale launcher pin (written by a different hcom build); re-run setup to re-pin")]
+    HookPinStale,
     #[error("event '{0}': hcom entry has 'type' != \"command\"")]
     HookTypeFieldNotCommand(String),
     #[error("event '{event}' name mismatch: expected {expected:?}, got {actual:?}")]
@@ -87,6 +89,30 @@ fn antigravity_hooks_path(gemini_dir: &Path) -> PathBuf {
 ///
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    // NRM-089 M1: a literal pin (absolute path, no spaces — the only form
+    // pinned_hcom_command produces) gets the three-way guard shared with the
+    // claude and gemini builders, keeping the base64 fallback JSON as the
+    // last resort; prefix forms keep the legacy shape.
+    if hcom_cmd.contains('/') && !hcom_cmd.contains(' ') {
+        let script = crate::runtime_env::pinned_hook_script(
+            hcom_cmd,
+            subcmd,
+            Some("ANTIGRAVITY_AGENT=1"),
+            (!fallback_json.is_empty()).then_some(fallback_json),
+        );
+        if cfg!(windows) {
+            let warn = "echo hcom hook: pinned binary missing; using hcom from PATH 1>&2";
+            if fallback_json.is_empty() {
+                return format!(
+                    "if exist \"{hcom_cmd}\" (set \"ANTIGRAVITY_AGENT=1\" && \"{hcom_cmd}\" {subcmd}) else (where hcom >nul 2>nul && ({warn} && set \"ANTIGRAVITY_AGENT=1\" && hcom {subcmd}) || exit /b 0)"
+                );
+            }
+            return format!(
+                "if exist \"{hcom_cmd}\" (set \"ANTIGRAVITY_AGENT=1\" && \"{hcom_cmd}\" {subcmd}) else (where hcom >nul 2>nul && ({warn} && set \"ANTIGRAVITY_AGENT=1\" && hcom {subcmd}) || (echo {fallback_json} & exit /b 0))"
+            );
+        }
+        return format!("sh -c {}", crate::runtime_env::sh_single_quote(&script));
+    }
     if cfg!(windows) {
         let invoke = format!("set \"ANTIGRAVITY_AGENT=1\" && {hcom_cmd} {subcmd}");
         if fallback_json.is_empty() {
@@ -305,6 +331,24 @@ fn remove_hooks_lifecycle_block_at(path: &Path) -> bool {
     crate::paths::atomic_write_io(path, &json_str).is_ok()
 }
 
+/// True when any `command` string under `value` is an hcom hook command
+/// whose literal launcher pin is not the current binary (NRM-089 M2).
+fn json_has_stale_pin(value: &Value) -> bool {
+    match value {
+        Value::Object(o) => {
+            if let Some(Value::String(cmd)) = o.get("command")
+                && cmd.contains("hcom")
+                && !crate::runtime_env::hook_command_pin_current(cmd)
+            {
+                return true;
+            }
+            o.values().any(json_has_stale_pin)
+        }
+        Value::Array(a) => a.iter().any(json_has_stale_pin),
+        _ => false,
+    }
+}
+
 fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFailReason> {
     if !path.exists() {
         return Err(VerifyFailReason::SettingsUnreadableOrEmpty);
@@ -321,6 +365,12 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
         .get("hcom-lifecycle")
         .and_then(|v| v.as_object())
         .ok_or(VerifyFailReason::HcomLifecycleKeyMissing)?;
+
+    // NRM-089 M2: any hcom hook command carrying a stale pin (written by a
+    // different hcom build) means the hooks must be rewritten.
+    if json_has_stale_pin(&Value::Object(lifecycle.clone())) {
+        return Err(VerifyFailReason::HookPinStale);
+    }
 
     // Check PreInvocation
     let pre_invocation = lifecycle
@@ -1059,8 +1109,12 @@ mod tests {
                                 "hook must invoke the launcher's own binary: {cmd}"
                             );
                             assert!(
-                                !cmd.contains("exec hcom "),
-                                "the pinned form must not PATH-resolve hcom: {cmd}"
+                                cmd.contains("[ -x \"$cmd\" ]"),
+                                "the pinned form carries the exists-guard: {cmd}"
+                            );
+                            assert!(
+                                cmd.contains("is missing; using hcom from PATH"),
+                                "the guard names the missing pin on the PATH fallback: {cmd}"
                             );
                             pinned += 1;
                         }

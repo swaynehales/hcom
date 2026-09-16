@@ -56,6 +56,15 @@ pub(crate) fn build_hcom_command() -> String {
 /// resolved. Like the claude builder, the literal form assumes a
 /// space-free path — anything else keeps the PATH-resolved fallback.
 pub(crate) fn pinned_hcom_command() -> String {
+    match pinned_hcom_binary() {
+        Some(exe) => exe,
+        None => build_hcom_command(),
+    }
+}
+
+/// The current process's canonicalized binary path, when it can serve as a
+/// literal hook-command pin. `None` keeps the prefix/env forms (uvx runs).
+pub(crate) fn pinned_hcom_binary() -> Option<String> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok())
@@ -66,10 +75,68 @@ pub(crate) fn pinned_hcom_command() -> String {
         })
         .unwrap_or_default();
     if !exe.is_empty() && exe.contains('/') {
-        exe
+        Some(exe)
     } else {
-        build_hcom_command()
+        None
     }
+}
+
+/// Embed `s` in a shell single-quoted context.
+pub(crate) fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The three-way guard shared by the claude, gemini and antigravity hook
+/// builders (NRM-089 review M1): exec the pinned launcher binary while it
+/// still exists; if the pin is gone (build moved/deleted), print a one-line
+/// stderr warning naming the missing pin and exec `hcom` from PATH; if that
+/// is gone too, run the silent tail — `exit 0`, or antigravity's base64
+/// fallback JSON as the last resort. `exec_env` prefixes both execs
+/// (`ANTIGRAVITY_AGENT=1`).
+///
+/// The result is a POSIX shell snippet that begins with `cmd='<pin>';` —
+/// the claude builder runs it inline (claude executes hook commands through
+/// a shell on every platform), gemini/antigravity embed it in
+/// `sh -c <quoted snippet>`.
+pub(crate) fn pinned_hook_script(
+    pin: &str,
+    suffix: &str,
+    exec_env: Option<&str>,
+    fallback_json: Option<&str>,
+) -> String {
+    let pin_q = sh_single_quote(pin);
+    let env_prefix = exec_env.map(|e| format!("{e} ")).unwrap_or_default();
+    let tail = match fallback_json {
+        None => "exit 0".to_string(),
+        Some(json) => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+            format!("{{ printf %s {b64} | base64 -d; exit 0; }}")
+        }
+    };
+    format!(
+        "cmd={pin_q}; if [ -x \"$cmd\" ]; then {env_prefix}exec \"$cmd\" {suffix}; \
+         elif command -v hcom >/dev/null 2>&1; then \
+         printf '%s\\n' \"hcom hook: pinned binary $cmd is missing; using hcom from PATH\" >&2; \
+         {env_prefix}exec hcom {suffix}; else {tail}; fi"
+    )
+}
+
+/// Does an installed hook command still carry the CURRENT binary's pin?
+/// (NRM-089 review M2.) A literal pin pointing anywhere else, or a
+/// prefix/env form while the current binary can pin, is stale and the hooks
+/// must be rewritten. When the current binary cannot pin (uvx), the
+/// prefix/env forms are the current shape and count as installed.
+pub(crate) fn hook_command_pin_current(command: &str) -> bool {
+    match pinned_hcom_binary() {
+        Some(exe) => command.contains(exe.as_str()),
+        None => !has_stale_literal_pin(command),
+    }
+}
+
+/// A literal-pinned hook command whose pin is not the current binary.
+fn has_stale_literal_pin(command: &str) -> bool {
+    command.contains("cmd=") && !command.contains("${HCOM")
 }
 
 /// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).
