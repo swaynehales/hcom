@@ -2721,11 +2721,13 @@ static RE_HCOM_PY_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r#"hcom\.py["']?\s+({})\b"#, pattern)).unwrap()
 });
 static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom").unwrap());
-/// Literal launcher-binary hook command: `cmd='/abs/path/to/hcom'; …` — the
-/// path may carry a suffix (test binaries hash their names), so match any
-/// single-quoted path containing an hcom segment.
+/// Literal launcher-binary hook command: `cmd='/abs/path/to/hcom'; …`. The
+/// basename must be the hcom executable — exactly `hcom`, or `hcom-<suffix>`
+/// (test binaries hash their names) — and the hcom segment must END the
+/// path, so a user directory like `hcom-notes` containing some other
+/// executable does not match.
 static RE_LITERAL_HCOM_PATH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"cmd='[^']*hcom[^']*'"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"cmd='[^']*/hcom(-[^/']*)?'"#).unwrap());
 
 /// Resolve the Claude config directory.
 ///
@@ -4261,6 +4263,15 @@ mod tests {
         assert!(is_hcom_hook_command(&command), "{command}");
         assert!(is_hcom_hook_command(
             "cmd='/opt/hcom/bin/hcom'; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd sessionstart || exit 0"
+        ));
+        assert!(is_hcom_hook_command(
+            "cmd='/var/folders/deps/hcom-9ab2c3'; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd sessionstart || exit 0"
+        ));
+        assert!(!is_hcom_hook_command(
+            "cmd='/Users/x/my-hcom-notes/settings'; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd notes || exit 0"
+        ));
+        assert!(!is_hcom_hook_command(
+            "cmd='/Users/x/hcom-notes/run'; exec $cmd notes || exit 0"
         ));
     }
 
