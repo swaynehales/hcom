@@ -60,6 +60,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             background: preview_background,
             args: &tool_args,
             tag: tag.as_deref(),
+            instance_name: hcom_flags.instance_name.as_deref(),
             cwd: dir_override.as_deref(),
             terminal: terminal.as_deref(),
             config: &hcom_config,
@@ -350,6 +351,7 @@ pub(crate) struct LaunchPreview<'a> {
     pub background: bool,
     pub args: &'a [String],
     pub tag: Option<&'a str>,
+    pub instance_name: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub terminal: Option<&'a str>,
     pub config: &'a HcomConfig,
@@ -410,6 +412,9 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
     println!("Terminal: {}", terminal);
     if let Some(t) = preview.tag {
         println!("Tag: {} (names will be {}-*)", t, t);
+    }
+    if let Some(name) = preview.instance_name {
+        println!("Instance name: {name} (--instance-name claim)");
     }
     for note in preview.notes {
         println!("{note}");
