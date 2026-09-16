@@ -664,17 +664,25 @@ impl HcomDb {
             return;
         }
 
-        let _ = self.log_life_event(
+        // Transfer fields at the top level of the event data — a reader
+        // scanning the ledger must not dig inside a "snapshot" wrapper to
+        // see who moved the label.
+        let _ = self.log_event(
+            "life",
             instance_name,
-            "succession",
-            "launch",
-            "reservation promoted at SessionStart",
-            Some(serde_json::json!({
+            &serde_json::json!({
+                "action": "succession",
+                "by": "launch",
+                "reason": "reservation promoted at SessionStart",
                 "displaced_name": instance_name,
-                "displaced_session_id": displaced_session_id,
+                "displaced_session_id": if displaced_session_id.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(displaced_session_id)
+                },
                 "claimer_session_id": session_id,
                 "last_event_id": displaced_last_event_id,
-            })),
+            }),
         );
         let _ = self.kv_delete_prefix(&key);
         let _ = self.kv_delete_prefix(&format!("{RESERVATION_OWNER_KEY}{instance_name}"));
@@ -727,17 +735,18 @@ impl HcomDb {
                     .or(Some(serde_json::Value::Null))
             })
             .unwrap_or(serde_json::Value::Null);
-        let _ = self.log_life_event(
+        let _ = self.log_event(
+            "life",
             instance_name,
-            "succession_claimer_backfill",
-            "sessionstart",
-            "first bind after a bare-shell claim",
-            Some(serde_json::json!({
+            &serde_json::json!({
+                "action": "succession_claimer_backfill",
+                "by": "sessionstart",
+                "reason": "first bind after a bare-shell claim",
                 "displaced_name": instance_name,
                 "displaced_session_id": displaced_session_id,
                 "claimer_session_id": session_id,
                 "backfills_event_id": event_id,
-            })),
+            }),
         );
     }
 
@@ -862,7 +871,7 @@ impl HcomDb {
 
         let now = now_epoch_f64();
         let validation_key = claude_lineage_validation_key(session_id);
-        self.with_immediate_transaction(|txn| {
+        let foreign_stale = self.with_immediate_transaction(|txn| {
             let old_primary_session = txn
                 .query_row(
                     "SELECT session_id FROM instances WHERE name = ?",
@@ -965,7 +974,16 @@ impl HcomDb {
                 classification,
                 ClaudeProcessBindingClassification::ForeignStale
             ))
-        })
+        })?;
+
+        // The claude generation bind is its own binding write — it goes
+        // through neither rebind helper, so the launch-path succession
+        // promotion and the claimer backfill are wired here too: this is the
+        // moment a pre-registered --instance-name reservation actually
+        // changes hands.
+        self.maybe_log_pending_succession(instance_name, session_id);
+        self.maybe_backfill_succession_claimer(instance_name, session_id);
+        Ok(foreign_stale)
     }
 
     /// Delete all process bindings for an instance.

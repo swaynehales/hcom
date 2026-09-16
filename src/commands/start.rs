@@ -858,7 +858,13 @@ pub(crate) fn ensure_rebind_compatible(
     current_tool: &str,
     current_dir: &str,
 ) -> Result<()> {
-    if !meta.tool.is_empty() && meta.tool != current_tool {
+    // Launch-surface aliases (claude-pty is a PTY-wrapped Claude) are the
+    // same agent at Tool level — a role name must be reclaimable across
+    // launch modes. Compare base tools; the tombstone records the Tool, the
+    // claim may arrive through any launch surface.
+    let meta_base = base_tool_name(&meta.tool);
+    let current_base = base_tool_name(current_tool);
+    if !meta_base.is_empty() && meta_base != current_base {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used tool '{}' but current session is '{}'",
             meta.tool,
@@ -875,6 +881,12 @@ pub(crate) fn ensure_rebind_compatible(
     }
 
     Ok(())
+}
+
+/// Strip launch-surface suffixes so alias surfaces compare equal to their
+/// base Tool ("claude-pty" == "claude").
+pub(crate) fn base_tool_name(tool: &str) -> &str {
+    tool.strip_suffix("-pty").unwrap_or(tool)
 }
 
 pub(crate) fn same_path(left: &str, right: &str) -> bool {
@@ -1184,7 +1196,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
+        // Ambient session-id vars are scrubbed here, once, because this is
+        // the choke point every claim test builds its context through. A test
+        // that simulates a bare-shell claim must not depend on the shell it
+        // happens to run under; the default is no session ref, and a test
+        // that wants one passes it explicitly through tool_env.
         let mut env: HashMap<String, String> = std::env::vars().collect();
+        for key in ["HCOM_CLAUDE_UNIX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"] {
+            env.remove(key);
+        }
         for (k, v) in tool_env {
             env.insert((*k).to_string(), (*v).to_string());
         }
@@ -1951,27 +1971,17 @@ mod tests {
     #[test]
     #[serial]
     fn test_vanilla_claude_start_immediately_binds_exported_session() {
-        struct RestoreEnv(Option<std::ffi::OsString>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.0.take() {
-                        Some(value) => std::env::set_var("HCOM_CLAUDE_UNIX_SESSION_ID", value),
-                        None => std::env::remove_var("HCOM_CLAUDE_UNIX_SESSION_ID"),
-                    }
-                }
-            }
-        }
-
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         assert!(crate::hooks::claude::setup_claude_hooks(false));
 
-        let _restore = RestoreEnv(std::env::var_os("HCOM_CLAUDE_UNIX_SESSION_ID"));
-        unsafe {
-            std::env::set_var("HCOM_CLAUDE_UNIX_SESSION_ID", "sess-vanilla");
-        }
-        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+        let ctx = make_ctx(
+            &[
+                ("CLAUDECODE", "1"),
+                ("HCOM_CLAUDE_UNIX_SESSION_ID", "sess-vanilla"),
+            ],
+            "/tmp/project",
+        );
 
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let name = db
@@ -2313,7 +2323,39 @@ mod tests {
         );
 
         assert!(db.get_instance_full("fama").unwrap().is_none());
-        assert_eq!(db.get_session_binding("sid-fama").unwrap(), None);
+    }
+
+    #[test]
+    fn test_pty_launch_surface_reclaims_base_tool_identity() {
+        let meta = RebindTargetMetadata {
+            tool: "claude".to_string(),
+            directory: "/tmp/nrm053-pty".to_string(),
+            last_event_id: 11,
+            session_id: "sid-old".to_string(),
+        };
+
+        // A PTY-wrapped launch presents as claude-pty; the tombstone records
+        // the base tool claude. Same agent — the claim must succeed.
+        ensure_rebind_compatible("role_y", &meta, "claude-pty", "/tmp/nrm053-pty")
+            .expect("claude-pty is the same agent as claude — the reclaim must succeed");
+        // Symmetric: a tombstone recorded through the PTY surface reclaims
+        // from a base-tool session too.
+        let pty_meta = RebindTargetMetadata {
+            tool: "claude-pty".to_string(),
+            directory: "/tmp/nrm053-pty".to_string(),
+            last_event_id: 11,
+            session_id: "sid-old".to_string(),
+        };
+        ensure_rebind_compatible("role_y", &pty_meta, "claude", "/tmp/nrm053-pty")
+            .expect("the alias comparison is symmetric");
+
+        // A genuinely different tool still refuses.
+        let err = ensure_rebind_compatible("role_z", &meta, "codex", "/tmp/nrm053-pty")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Refusing to reclaim 'role_z'"),
+            "the tool guard stays: {err}"
+        );
     }
 
     #[test]

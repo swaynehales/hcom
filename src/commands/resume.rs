@@ -758,6 +758,7 @@ fn print_resume_preview(
         background: plan.output.background,
         args: &plan.launch.args,
         tag: plan.output.tag.as_deref(),
+        instance_name: plan.launch.name.as_deref(),
         cwd: Some(cwd_str),
         terminal: plan.output.terminal.as_deref(),
         config: hcom_config,
