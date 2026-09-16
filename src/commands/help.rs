@@ -393,6 +393,14 @@ const START_HELP: &[HelpEntry] = &[
         "Reclaim identity (after compaction/resume/clear)",
     ),
     (
+        "start --as <name> --force",
+        "Take over a LIVE name — displaces the running session; the takeover is logged",
+    ),
+    (
+        "start --as <name> --adopt-unknown",
+        "Claim a name with no row and no tombstone, as a provisional name",
+    ),
+    (
         "start --orphan <name|pid>",
         "Recover orphaned PTY process from pidtrack",
     ),
@@ -951,7 +959,7 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
     (
         "--instance-name <name>",
-        "Explicit instance name (single launch only)",
+        "Claim this instance name (succession if it was held before; single launch only)",
     ),
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
