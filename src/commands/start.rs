@@ -638,6 +638,10 @@ fn start_rebind_opts(
             },
         );
         data.insert("directory".into(), json!(cwd_override));
+        // The claim moment records the launch directory too (review F5):
+        // without it a start --as-claimed row falls back to `directory`,
+        // which hooks then drift.
+        data.insert("launch_directory".into(), json!(cwd_override));
         data.insert("tool".into(), json!(tool));
         data.insert("background".into(), json!(0));
         data.insert("name_announced".into(), json!(1));
