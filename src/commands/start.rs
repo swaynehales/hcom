@@ -455,7 +455,7 @@ fn start_rebind_opts(
 
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
     if let Some(ref meta) = target_meta {
-        ensure_rebind_compatible(&target_name, meta, ctx.tool.as_str(), &ctx.cwd.to_string_lossy())?;
+        ensure_rebind_compatible(&target_name, meta, &ctx.cwd.to_string_lossy())?;
     }
 
     // Preserve last_event_id from target (cursor preservation)
@@ -855,23 +855,11 @@ pub(crate) struct RebindTargetMetadata {
 pub(crate) fn ensure_rebind_compatible(
     target_name: &str,
     meta: &RebindTargetMetadata,
-    current_tool: &str,
     current_dir: &str,
 ) -> Result<()> {
-    // Launch-surface aliases (claude-pty is a PTY-wrapped Claude) are the
-    // same agent at Tool level — a role name must be reclaimable across
-    // launch modes. Compare base tools; the tombstone records the Tool, the
-    // claim may arrive through any launch surface.
-    let meta_base = base_tool_name(&meta.tool);
-    let current_base = base_tool_name(current_tool);
-    if !meta_base.is_empty() && meta_base != current_base {
-        bail!(
-            "Refusing to reclaim '{target_name}': latest identity used tool '{}' but current session is '{}'",
-            meta.tool,
-            current_tool
-        );
-    }
-
+    // A name is a label, not a tool binding (DEC-030): a stopped name may be
+    // reclaimed by any tool. Hijack protection is the liveness gate plus the
+    // directory check below.
     if !meta.directory.is_empty() && !same_path(&meta.directory, current_dir) {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used directory '{}' but current session is '{}'",
@@ -881,12 +869,6 @@ pub(crate) fn ensure_rebind_compatible(
     }
 
     Ok(())
-}
-
-/// Strip launch-surface suffixes so alias surfaces compare equal to their
-/// base Tool ("claude-pty" == "claude").
-pub(crate) fn base_tool_name(tool: &str) -> &str {
-    tool.strip_suffix("-pty").unwrap_or(tool)
 }
 
 pub(crate) fn same_path(left: &str, right: &str) -> bool {
@@ -2326,35 +2308,24 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_launch_surface_reclaims_base_tool_identity() {
+    fn test_reclaim_across_tools_is_allowed() {
         let meta = RebindTargetMetadata {
-            tool: "claude".to_string(),
-            directory: "/tmp/nrm053-pty".to_string(),
+            tool: "opencode".to_string(),
+            directory: "/tmp/nrm053-xtool".to_string(),
             last_event_id: 11,
             session_id: "sid-old".to_string(),
         };
 
-        // A PTY-wrapped launch presents as claude-pty; the tombstone records
-        // the base tool claude. Same agent — the claim must succeed.
-        ensure_rebind_compatible("role_y", &meta, "claude-pty", "/tmp/nrm053-pty")
-            .expect("claude-pty is the same agent as claude — the reclaim must succeed");
-        // Symmetric: a tombstone recorded through the PTY surface reclaims
-        // from a base-tool session too.
-        let pty_meta = RebindTargetMetadata {
-            tool: "claude-pty".to_string(),
-            directory: "/tmp/nrm053-pty".to_string(),
-            last_event_id: 11,
-            session_id: "sid-old".to_string(),
-        };
-        ensure_rebind_compatible("role_y", &pty_meta, "claude", "/tmp/nrm053-pty")
-            .expect("the alias comparison is symmetric");
+        // A stopped name is a label any tool may reclaim.
+        ensure_rebind_compatible("role_y", &meta, "/tmp/nrm053-xtool")
+            .expect("the claiming tool is not compared");
 
-        // A genuinely different tool still refuses.
-        let err = ensure_rebind_compatible("role_z", &meta, "codex", "/tmp/nrm053-pty")
+        // The directory guard stays.
+        let err = ensure_rebind_compatible("role_z", &meta, "/tmp/elsewhere")
             .unwrap_err();
         assert!(
-            err.to_string().contains("Refusing to reclaim 'role_z'"),
-            "the tool guard stays: {err}"
+            err.to_string().contains("latest identity used directory"),
+            "the directory guard stays: {err}"
         );
     }
 
