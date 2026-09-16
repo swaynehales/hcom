@@ -53,8 +53,7 @@ pub(crate) fn build_hcom_command() -> String {
 /// installed binary, an older fork). Mirrors the claude fix (b0acb8c):
 /// embed the current process's canonicalized binary path, falling back to
 /// the prefix form (`hcom`, or `uvx hcom`) only when the path cannot be
-/// resolved. Like the claude builder, the literal form assumes a
-/// space-free path — anything else keeps the PATH-resolved fallback.
+/// resolved. The guard execs the pin quoted, so paths with spaces pin fine.
 pub(crate) fn pinned_hcom_command() -> String {
     match pinned_hcom_binary() {
         Some(exe) => exe,
@@ -127,11 +126,26 @@ pub(crate) fn pinned_hook_script(
 /// prefix/env form while the current binary can pin, is stale and the hooks
 /// must be rewritten. When the current binary cannot pin (uvx), the
 /// prefix/env forms are the current shape and count as installed.
+///
+/// The stored command carries the pin shell-escaped (apostrophes become
+/// `'\''`, plus one more layer inside gemini/antigravity's `sh -c`), so the
+/// match runs on both strings with quote/backslash characters removed —
+/// the same escaping the builders apply, inverted rather than re-copied.
 pub(crate) fn hook_command_pin_current(command: &str) -> bool {
     match pinned_hcom_binary() {
-        Some(exe) => command.contains(exe.as_str()),
+        Some(exe) => command_contains_pin(command, &exe),
         None => !has_stale_literal_pin(command),
     }
+}
+
+/// True when `command` embeds `pin`, directly or under any single-quote /
+/// backslash escaping the shell builders may have layered on it.
+pub(crate) fn command_contains_pin(command: &str, pin: &str) -> bool {
+    if command.contains(pin) {
+        return true;
+    }
+    let stripped = |s: &str| s.chars().filter(|c| *c != '\'' && *c != '\\').collect::<String>();
+    stripped(command).contains(&stripped(pin))
 }
 
 /// A literal-pinned hook command whose pin is not the current binary.
@@ -491,5 +505,28 @@ mod tests {
             super::opencode_family_data_dir("opencode"),
             Some(home.join(".local/share/opencode"))
         );
+    }
+
+    #[test]
+    fn command_contains_pin_matches_escaped_and_spaced_pins() {
+        // Apostrophe path: the stored form carries the pin sh-escaped —
+        // once for the claude builder, twice inside gemini/antigravity's
+        // `sh -c`. The matcher must survive every layer.
+        for pin in [
+            "/Users/O'Brien/tools/hcom",
+            "/Users/sp ace/tools/hcom",
+            "/plain/path/hcom",
+        ] {
+            let script = super::pinned_hook_script(pin, "gemini-sessionstart", None, None);
+            // claude stores the script inline (single escape layer is inside
+            // the script itself); gemini/antigravity wrap it in `sh -c`.
+            let wrapped = format!("sh -c {}", super::sh_single_quote(&script));
+            assert!(super::command_contains_pin(&script, pin), "inline: {script}");
+            assert!(super::command_contains_pin(&wrapped, pin), "wrapped: {wrapped}");
+            assert!(
+                !super::command_contains_pin(&wrapped, "/elsewhere/hcom"),
+                "a different pin must not match: {wrapped}"
+            );
+        }
     }
 }

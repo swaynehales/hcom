@@ -1303,10 +1303,11 @@ pub enum SetupError {
 /// match what actually executes it.
 fn hook_command(hcom_cmd: &str, cmd_suffix: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-    // NRM-089 M1: a literal pin (absolute path, no spaces — the only form
+    // NRM-089 M1: a literal pin (absolute path — the only form
     // pinned_hcom_command produces) gets the three-way guard shared with the
-    // claude and antigravity builders; prefix forms keep the legacy shape.
-    if hcom_cmd.contains('/') && !hcom_cmd.contains(' ') {
+    // claude and antigravity builders; the guard execs "$cmd" quoted, so
+    // paths with spaces are safe; prefix forms keep the legacy shape.
+    if hcom_cmd.contains('/') {
         let script = crate::runtime_env::pinned_hook_script(hcom_cmd, cmd_suffix, None, None);
         if cfg!(windows) {
             let warn = "echo hcom hook: pinned binary missing; using hcom from PATH 1>&2";
