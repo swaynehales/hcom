@@ -1,5 +1,7 @@
 //! Shared runtime helpers for invoking hcom and locating tool config roots.
 
+use std::path::Path;
+
 /// Cached hcom invocation prefix (computed once per process lifetime).
 static HCOM_PREFIX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     if std::env::var("HCOM_DEV_ROOT").is_ok() {
@@ -83,6 +85,71 @@ pub(crate) fn pinned_hcom_binary() -> Option<String> {
 /// Embed `s` in a shell single-quoted context.
 pub(crate) fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Basename of a path; the path itself when it has no final component
+/// (mirrors `basename` for the degenerate root case).
+fn path_basename(p: &str) -> String {
+    std::path::Path::new(p)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.to_string())
+}
+
+/// Normalize a composed role name, once, exactly as docs/operator/
+/// hcom-role.zsh does (design §1e): lowercase ASCII; `-`, `.` and space
+/// become `_`; drop everything outside `[a-z0-9_]`; collapse repeated `_`;
+/// trim leading and trailing `_`.
+pub(crate) fn normalize_composed_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars().map(|c| c.to_ascii_lowercase()) {
+        match c {
+            '-' | '.' | ' ' => out.push('_'),
+            c if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' => out.push(c),
+            _ => {}
+        }
+    }
+    let mut collapsed = String::with_capacity(out.len());
+    for c in out.chars() {
+        if c == '_' && collapsed.ends_with('_') {
+            continue;
+        }
+        collapsed.push(c);
+    }
+    collapsed.trim_matches('_').to_string()
+}
+
+/// Derive the `<project>_<role>` instance name for `--role` (design §1e,
+/// ported from docs/operator/hcom-role.zsh — do not re-derive).
+///
+/// Project half: the basename of the main repository root (the parent of
+/// `--git-common-dir`, via the same `project_root_of`/`git_query` helpers
+/// the claim's project check uses — env scrub, 3s timeout, bare-repo and
+/// submodule rules); outside a repo, the cwd basename. Worktree half: when
+/// `--show-toplevel` differs from the main root, `_wt_<toplevel basename>`
+/// is appended, so two worktrees never contend for one name. The COMPOSED
+/// name is normalized once; an empty result is the caller's error.
+pub(crate) fn derive_role_instance_name(role: &str, cwd: &Path) -> String {
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let project_root = crate::commands::start::project_root_of(&cwd_str);
+    let project = match &project_root {
+        Some(root) => path_basename(&root.to_string_lossy()),
+        None => path_basename(&cwd_str),
+    };
+    let mut name = format!("{project}_{role}");
+    if let (Some(root), Some(top)) = (
+        project_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        crate::commands::start::git_query(&cwd_str, &["rev-parse", "--show-toplevel"]),
+    ) {
+        let root_n = crate::commands::start::normalize_path_for_compare(&root);
+        let top_n = crate::commands::start::normalize_path_for_compare(&top);
+        if root_n != top_n {
+            name.push_str(&format!("_wt_{}", path_basename(&top)));
+        }
+    }
+    normalize_composed_name(&name)
 }
 
 /// The three-way guard shared by the claude, gemini and antigravity hook
@@ -256,6 +323,70 @@ mod escape_tests {
 // (Windows resolves USERPROFILE and prefixes canonical paths with \\?\).
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn normalize_composed_name_matches_hcom_role_zsh() {
+        let cases = [
+            ("nurmterm_lead", "nurmterm_lead"),
+            ("sys-comms-memos_lead", "sys_comms_memos_lead"),
+            ("memory-system_lead", "memory_system_lead"),
+            ("arlo_review", "arlo_review"),
+            ("sys-comms-memos_Lead Reviewer_wt_PR-147", "sys_comms_memos_lead_reviewer_wt_pr_147"),
+            ("--__--", ""),
+            ("", ""),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(super::normalize_composed_name(raw), expected, "input: {raw}");
+        }
+    }
+
+    #[test]
+    fn derive_role_instance_name_matches_field_cases() {
+        // Repo named like the operator's scratch projects.
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("sys-comms-memos");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        g(&repo, &["init", "-q"]);
+        g(&repo, &["config", "user.email", "t@example.com"]);
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["commit", "--allow-empty", "-q", "-m", "i"]);
+        let wt = base.path().join("wt");
+        g(&repo, &["worktree", "add", wt.to_str().unwrap()]);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let nonrepo = base.path().join("plain-dir");
+        std::fs::create_dir_all(&nonrepo).unwrap();
+
+        // Main checkout: no worktree suffix.
+        assert_eq!(
+            super::derive_role_instance_name("lead", &repo),
+            "sys_comms_memos_lead"
+        );
+        // Subfolder of the same repo: same name.
+        assert_eq!(
+            super::derive_role_instance_name("lead", &sub),
+            "sys_comms_memos_lead"
+        );
+        // Linked worktree: _wt_ suffix from the toplevel basename.
+        assert_eq!(
+            super::derive_role_instance_name("review", &wt),
+            "sys_comms_memos_review_wt_wt"
+        );
+        // Non-repo: cwd basename as the project half.
+        assert_eq!(
+            super::derive_role_instance_name("review", &nonrepo),
+            "plain_dir_review"
+        );
+    }
+
     use crate::hooks::test_helpers::EnvGuard;
     use serial_test::serial;
 

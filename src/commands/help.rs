@@ -401,6 +401,10 @@ const START_HELP: &[HelpEntry] = &[
         "Claim a name with no row and no tombstone, as a provisional name",
     ),
     (
+        "start --as-role <value>",
+        "Reclaim the derived role name for this directory (<project>_<value>; fleet-wide, project-prefixed) — same claim as --as with that name",
+    ),
+    (
         "start --orphan <name|pid>",
         "Recover orphaned PTY process from pidtrack",
     ),
@@ -960,6 +964,10 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     (
         "--instance-name <name>",
         "Claim this instance name (succession if it was held before; single launch only)",
+    ),
+    (
+        "--role <value>",
+        "Claim the derived role name <project>_<value> for this directory (same as --instance-name with that name; single launch only). The name is fleet-wide and project-prefixed",
     ),
     ("--terminal <preset>", "Where new windows open"),
     ("--dir <path>", "Working directory"),
