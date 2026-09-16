@@ -37,9 +37,13 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        19,
+        "ALTER TABLE instances ADD COLUMN launch_directory TEXT DEFAULT '';",
+    ),
     (
         17,
         "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
@@ -319,6 +323,7 @@ impl HcomDb {
                 status_detail TEXT DEFAULT '',
                 last_stop INTEGER DEFAULT 0,
                 directory TEXT,
+                launch_directory TEXT DEFAULT '',
                 created_at REAL NOT NULL,
                 transcript_path TEXT DEFAULT '',
                 tcp_mode INTEGER DEFAULT 0,

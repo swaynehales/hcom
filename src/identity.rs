@@ -972,6 +972,7 @@ mod tests {
 
     fn default_instance() -> InstanceRow {
         InstanceRow {
+            launch_directory: String::new(),
             name: String::new(),
             session_id: None,
             parent_session_id: None,
