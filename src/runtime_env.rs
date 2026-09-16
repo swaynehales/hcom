@@ -46,6 +46,32 @@ pub(crate) fn build_hcom_command() -> String {
     get_hcom_prefix().join(" ")
 }
 
+/// The launching binary's absolute path for hook commands (NRM-089).
+///
+/// A session launched by one build must run its hooks against that same
+/// build; a PATH-resolved `hcom` can be a different version entirely (the
+/// installed binary, an older fork). Mirrors the claude fix (b0acb8c):
+/// embed the current process's canonicalized binary path, falling back to
+/// the prefix form (`hcom`, or `uvx hcom`) only when the path cannot be
+/// resolved. Like the claude builder, the literal form assumes a
+/// space-free path — anything else keeps the PATH-resolved fallback.
+pub(crate) fn pinned_hcom_command() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| {
+            crate::shared::platform::child_process_path(&p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .unwrap_or_default();
+    if !exe.is_empty() && exe.contains('/') {
+        exe
+    } else {
+        build_hcom_command()
+    }
+}
+
 /// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).
 pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")

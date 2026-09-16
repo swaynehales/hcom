@@ -146,7 +146,9 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
         serde_json::Map::new()
     };
 
-    let hcom_cmd = crate::runtime_env::build_hcom_command();
+    // NRM-089: pin the launching binary so hooks run against the build that
+    // launched the session, not whatever `hcom` is on PATH.
+    let hcom_cmd = crate::runtime_env::pinned_hcom_command();
 
     // Fallback JSON constants for hooks where agy requires a decision response when
     // hcom is missing. PreToolUse needs `{"decision":"allow"}`; Stop needs a decision
@@ -1015,6 +1017,60 @@ mod tests {
         let (_dir, _test_home, _hooks_path, _guard) = antigravity_test_env();
         // File doesn't exist
         assert!(!verify_antigravity_hooks_installed(false));
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_antigravity_hooks_pin_the_launcher_binary() {
+        let (_dir, _test_home, hooks_path, _guard) = antigravity_test_env();
+        try_setup_antigravity_hooks(false).unwrap();
+        let content = std::fs::read_to_string(&hooks_path).unwrap();
+        let val: Value = serde_json::from_str(&content).unwrap();
+        let exe = crate::runtime_env::pinned_hcom_command();
+        let mut pinned = 0;
+        let mut total = 0;
+        // hcom-lifecycle maps hook types to arrays whose entries either
+        // carry "command" directly (PreInvocation/Stop) or nest a "hooks"
+        // array (PreToolUse/PostToolUse).
+        for (_, group) in val.as_object().unwrap() {
+            let Some(types) = group.as_object() else { continue };
+            for (_, arr) in types {
+                let Some(arr) = arr.as_array() else { continue };
+                for entry in arr {
+                    let mut cmds: Vec<&str> = Vec::new();
+                    if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
+                        cmds.push(cmd);
+                    }
+                    if let Some(nested) = entry.get("hooks").and_then(|v| v.as_array()) {
+                        for hook in nested {
+                            if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
+                                cmds.push(cmd);
+                            }
+                        }
+                    }
+                    for cmd in cmds {
+                        if !cmd.contains("hcom") {
+                            continue; // user hooks sharing the file
+                        }
+                        total += 1;
+                        if !exe.is_empty() && exe.contains('/') {
+                            assert!(
+                                cmd.contains(&exe),
+                                "hook must invoke the launcher's own binary: {cmd}"
+                            );
+                            assert!(
+                                !cmd.contains("exec hcom "),
+                                "the pinned form must not PATH-resolve hcom: {cmd}"
+                            );
+                            pinned += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if !exe.is_empty() && exe.contains('/') {
+            assert!(pinned > 0 && pinned == total, "every hook pinned: {pinned}/{total}");
+        }
     }
 
     #[test]

@@ -1369,7 +1369,9 @@ pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupErro
         remove_gemini_policy();
     }
 
-    let hcom_cmd = crate::runtime_env::build_hcom_command();
+    // NRM-089: pin the launching binary so hooks run against the build that
+    // launched the session, not whatever `hcom` is on PATH.
+    let hcom_cmd = crate::runtime_env::pinned_hcom_command();
 
     // Set hooksConfig.enabled
     set_hooks_enabled(&mut settings);
@@ -1895,6 +1897,43 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_setup_gemini_hooks_pin_the_launcher_binary() {
+        let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
+        assert!(setup_gemini_hooks(false));
+        let settings = read_json(&settings_path);
+        let exe = crate::runtime_env::pinned_hcom_command();
+        let mut pinned = 0;
+        let mut total = 0;
+        for (_, matchers_val) in settings.get("hooks").and_then(|v| v.as_object()).unwrap() {
+            let Some(matchers) = matchers_val.as_array() else {
+                continue; // "enabled"/"disabled" markers are not hook arrays
+            };
+            for matcher in matchers {
+                for hook in matcher.get("hooks").and_then(|v| v.as_array()).unwrap() {
+                    let cmd = hook.get("command").and_then(|v| v.as_str()).unwrap();
+                    total += 1;
+                    if !exe.is_empty() && exe.contains('/') {
+                        assert!(
+                            cmd.contains(&exe),
+                            "hook must invoke the launcher's own binary: {cmd}"
+                        );
+                        assert!(
+                            !cmd.contains("exec hcom "),
+                            "the pinned form must not PATH-resolve hcom: {cmd}"
+                        );
+                        pinned += 1;
+                    }
+                    assert!(is_hcom_hook(hook), "pinned form still recognized: {cmd}");
+                }
+            }
+        }
+        if !exe.is_empty() && exe.contains('/') {
+            assert!(pinned > 0 && pinned == total, "every hook pinned: {pinned}/{total}");
+        }
+    }
+
+    #[test]
     fn test_is_hcom_hook() {
         let hcom_hook = serde_json::json!({
             "name": "hcom-sessionstart",
@@ -2091,7 +2130,7 @@ mod tests {
         settings: &Value,
         expected: &[(&str, &str)], // (hook_type, cmd_suffix)
     ) -> Vec<String> {
-        let hcom_cmd = crate::runtime_env::build_hcom_command();
+        let hcom_cmd = crate::runtime_env::pinned_hcom_command();
         let mut missing = Vec::new();
         let hooks = match settings.get("hooks").and_then(|v| v.as_object()) {
             Some(h) => h,
@@ -2203,7 +2242,9 @@ mod tests {
                 format!("hcom-{}", hook_type.to_lowercase())
             );
             assert_eq!(hook["timeout"].as_u64().unwrap(), expected_timeout as u64);
-            let hcom = crate::runtime_env::build_hcom_command();
+            // The generator pins the launching binary (NRM-089); expect the
+            // same form.
+            let hcom = crate::runtime_env::pinned_hcom_command();
             let expected_command = hook_command(&hcom, cmd_suffix);
             assert_eq!(
                 hook["command"].as_str().unwrap(),
