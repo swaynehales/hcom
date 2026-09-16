@@ -13,8 +13,8 @@ pub enum VerifyFailReason {
     HookEventMissing(String),
     #[error("hcom hook command '{cmd_suffix}' not found under event '{event}'")]
     HookCommandMissing { event: String, cmd_suffix: String },
-    #[error("hcom hook commands carry a stale launcher pin (written by a different hcom build); re-run setup to re-pin")]
-    HookPinStale,
+    #[error("stored hook commands do not match what this build generates (stale pin or old guard shape); re-run setup to rewrite")]
+    HookFormStale,
     #[error("event '{0}': hcom entry has 'type' != \"command\"")]
     HookTypeFieldNotCommand(String),
     #[error("event '{event}' name mismatch: expected {expected:?}, got {actual:?}")]
@@ -176,7 +176,42 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
     // NRM-089: pin the launching binary so hooks run against the build that
     // launched the session, not whatever `hcom` is on PATH.
     let hcom_cmd = crate::runtime_env::pinned_hcom_command();
+    let hcom_lifecycle = build_hcom_lifecycle(&hcom_cmd);
 
+    hooks_root.insert("hcom-lifecycle".to_string(), hcom_lifecycle);
+
+    let json_str = serde_json::to_string_pretty(&Value::Object(hooks_root))
+        .map_err(SetupError::SerializationFailed)?;
+
+    crate::paths::atomic_write_io(&hooks_path, &json_str).map_err(|e| {
+        SetupError::AtomicWriteFailed {
+            path: hooks_path.clone(),
+            source: e,
+        }
+    })?;
+
+    // Agy stores permissions in its own settings.json under `permissions.allow`
+    // using `command(...)` rules (not the gemini-cli TOML policy engine).
+    if include_permissions {
+        setup_antigravity_permissions();
+    } else {
+        remove_antigravity_permissions();
+    }
+
+    verify_hooks_at(&hooks_path, include_permissions).map_err(|reason| {
+        SetupError::PostWriteVerifyFailed {
+            path: hooks_path,
+            reason,
+        }
+    })?;
+
+    Ok(())
+}
+
+/// The hcom-lifecycle group a given launcher command produces — the single
+/// source both setup and verify build from, so verify can require stored
+/// hook commands to be byte-equal to what this build generates (NRM-089).
+fn build_hcom_lifecycle(hcom_cmd: &str) -> Value {
     // Fallback JSON constants for hooks where agy requires a decision response when
     // hcom is missing. PreToolUse needs `{"decision":"allow"}`; Stop needs a decision
     // field where any value other than "continue" allows the stop. PostToolUse and the
@@ -188,7 +223,7 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
     // blocking the agent turn for half a minute.
     const HOOK_TIMEOUT_SEC: u64 = 15;
 
-    let hcom_lifecycle = json!({
+    json!({
         "PreInvocation": [
             {
                 "name": "hcom-sessionstart",
@@ -251,36 +286,7 @@ pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), Setu
                 ]
             }
         ]
-    });
-
-    hooks_root.insert("hcom-lifecycle".to_string(), hcom_lifecycle);
-
-    let json_str = serde_json::to_string_pretty(&Value::Object(hooks_root))
-        .map_err(SetupError::SerializationFailed)?;
-
-    crate::paths::atomic_write_io(&hooks_path, &json_str).map_err(|e| {
-        SetupError::AtomicWriteFailed {
-            path: hooks_path.clone(),
-            source: e,
-        }
-    })?;
-
-    // Agy stores permissions in its own settings.json under `permissions.allow`
-    // using `command(...)` rules (not the gemini-cli TOML policy engine).
-    if include_permissions {
-        setup_antigravity_permissions();
-    } else {
-        remove_antigravity_permissions();
-    }
-
-    verify_hooks_at(&hooks_path, include_permissions).map_err(|reason| {
-        SetupError::PostWriteVerifyFailed {
-            path: hooks_path,
-            reason,
-        }
-    })?;
-
-    Ok(())
+    })
 }
 
 /// Verify if Antigravity hooks are correctly installed.
@@ -332,21 +338,56 @@ fn remove_hooks_lifecycle_block_at(path: &Path) -> bool {
     crate::paths::atomic_write_io(path, &json_str).is_ok()
 }
 
-/// True when any `command` string under `value` is an hcom hook command
-/// whose literal launcher pin is not the current binary (NRM-089 M2).
-fn json_has_stale_pin(value: &Value) -> bool {
-    match value {
-        Value::Object(o) => {
-            if let Some(Value::String(cmd)) = o.get("command")
-                && cmd.contains("hcom")
-                && !crate::runtime_env::hook_command_pin_current(cmd)
-            {
-                return true;
+/// Build the name → expected-command map the current binary's lifecycle
+/// produces, so stored hooks can be compared byte-for-byte (NRM-089).
+fn expected_commands_by_name(expected: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(events) = expected.as_object() {
+        for arr in events.values() {
+            let Some(arr) = arr.as_array() else { continue };
+            for entry in arr {
+                let mut push = |name: Option<&str>, cmd: Option<&str>| {
+                    if let (Some(n), Some(c)) = (name, cmd) {
+                        out.push((n.to_string(), c.to_string()));
+                    }
+                };
+                push(
+                    entry.get("name").and_then(|v| v.as_str()),
+                    entry.get("command").and_then(|v| v.as_str()),
+                );
+                if let Some(hooks) = entry.get("hooks").and_then(|v| v.as_array()) {
+                    for hook in hooks {
+                        push(
+                            hook.get("name").and_then(|v| v.as_str()),
+                            hook.get("command").and_then(|v| v.as_str()),
+                        );
+                    }
+                }
             }
-            o.values().any(json_has_stale_pin)
         }
-        Value::Array(a) => a.iter().any(json_has_stale_pin),
-        _ => false,
+    }
+    out
+}
+
+/// True when every stored hcom hook whose name the current build knows is
+/// byte-equal to the command this build generates for it (NRM-089).
+fn lifecycle_commands_current(stored: &Value, expected_by_name: &[(String, String)]) -> bool {
+    match stored {
+        Value::Object(o) => {
+            if let (Some(Value::String(name)), Some(Value::String(cmd))) =
+                (o.get("name"), o.get("command"))
+                && let Some((_, exp)) = expected_by_name.iter().find(|(n, _)| n == name)
+                && exp != cmd
+            {
+                return false;
+            }
+            o.values()
+                .all(|v| lifecycle_commands_current(v, expected_by_name))
+        }
+        Value::Array(a) => a
+            .iter()
+            .all(|v| lifecycle_commands_current(v, expected_by_name)),
+        _ => true,
     }
 }
 
@@ -367,10 +408,15 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
         .and_then(|v| v.as_object())
         .ok_or(VerifyFailReason::HcomLifecycleKeyMissing)?;
 
-    // NRM-089 M2: any hcom hook command carrying a stale pin (written by a
-    // different hcom build) means the hooks must be rewritten.
-    if json_has_stale_pin(&Value::Object(lifecycle.clone())) {
-        return Err(VerifyFailReason::HookPinStale);
+    // NRM-089: a stored hcom hook is current only if it is byte-equal to
+    // the command this build generates for it — same pin AND same guard
+    // shape. Anything else (old pin, old guard) must be rewritten.
+    let expected = build_hcom_lifecycle(&crate::runtime_env::pinned_hcom_command());
+    if !lifecycle_commands_current(
+        &Value::Object(lifecycle.clone()),
+        &expected_commands_by_name(&expected),
+    ) {
+        return Err(VerifyFailReason::HookFormStale);
     }
 
     // Check PreInvocation

@@ -3052,8 +3052,8 @@ pub enum VerifyFailReason {
     HookTimeoutMissing { hook_type: String },
     #[error("duplicate hcom hook entry for hook type '{0}'")]
     HookDuplicated(String),
-    #[error("hook type '{hook_type}': pinned launcher binary is stale (hooks were written by a different hcom build); re-run setup to re-pin")]
-    HookPinStale { hook_type: String },
+    #[error("hook type '{hook_type}': stored hook command does not match what this build generates (stale pin or old guard shape); re-run setup to rewrite")]
+    HookFormStale { hook_type: String },
     #[error("HCOM env var not set in settings.json")]
     HcomEnvMissing,
     #[error("'permissions.allow' missing or not an array")]
@@ -3280,10 +3280,14 @@ fn verify_claude_hooks_inner(
                         return Err(VerifyFailReason::HookDuplicated(hook_type.to_string()));
                     }
 
-                    // NRM-089 M2: a pin written by a different hcom build is
-                    // stale — report not-installed so setup rewrites it.
-                    if !crate::runtime_env::hook_command_pin_current(command) {
-                        return Err(VerifyFailReason::HookPinStale {
+                    // NRM-089: a stored hcom hook is current only if it is
+                    // byte-equal to the command this build generates for the
+                    // hook — same pin AND same guard shape. The d8d1e19
+                    // same-path form shares the cmd='<pin>' prefix but lacks
+                    // the PATH-fallback guard; containment missed it.
+                    let expected = build_hook_entry_command(cmd_suffix);
+                    if command != expected {
+                        return Err(VerifyFailReason::HookFormStale {
                             hook_type: hook_type.to_string(),
                         });
                     }
@@ -4572,6 +4576,87 @@ mod tests {
     }
 
     #[test]
+    /// NRM-089 regression: the d8d1e19 pinned claude form shares the
+    /// `cmd='<pin>'` prefix but carries the old guard (`command -v … &&
+    /// exec … || exit 0`, no PATH fallback). With the SAME path installed,
+    /// pin-only matching judged it current and the hooks were never
+    /// rewritten; verify must reject it so setup rewrites all hooks.
+    #[test]
+    fn test_verify_rejects_d8d1e19_same_path_claude_form() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| {
+                crate::shared::platform::child_process_path(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .unwrap_or_default();
+        let old_form =
+            |suffix: &str| {
+                format!(
+                    "cmd='{exe}'; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {suffix} || exit 0"
+                )
+            };
+
+        let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
+        for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
+            let mut hook_entry = serde_json::json!({
+                "type": "command",
+                "command": old_form(cmd_suffix),
+            });
+            if let Some(t) = timeout {
+                hook_entry["timeout"] = serde_json::json!(t);
+            }
+            let mut hook_dict = serde_json::json!({"hooks": [hook_entry]});
+            if !matcher.is_empty() {
+                hook_dict["matcher"] = Value::String(matcher.to_string());
+            }
+            settings["hooks"][hook_type] = serde_json::json!([hook_dict]);
+        }
+        settings["permissions"] = serde_json::json!({"allow": build_claude_permissions()});
+
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !verify_claude_hooks_installed(Some(&settings_path), true),
+            "the d8d1e19 same-path form must fail verify so setup rewrites it"
+        );
+
+        // And the current build's own form verifies.
+        let mut current_settings = settings.clone();
+        for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
+            let arr = current_settings["hooks"][hook_type].as_array_mut().unwrap();
+            for matcher_obj in arr {
+                for hook in matcher_obj["hooks"].as_array_mut().unwrap() {
+                    hook["command"] = serde_json::json!(build_hook_entry_command(cmd_suffix));
+                    if timeout.is_some() {
+                        hook["timeout"] = serde_json::json!(timeout.unwrap());
+                    }
+                }
+                let _ = matcher;
+            }
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&current_settings).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verify_claude_hooks_installed(Some(&settings_path), true),
+            "the current build's form must verify"
+        );
+    }
+
     fn test_verify_catches_timeout_field_dropped() {
         crate::config::Config::init();
         let dir = tempfile::tempdir().unwrap();

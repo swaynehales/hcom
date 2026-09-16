@@ -121,31 +121,17 @@ pub(crate) fn pinned_hook_script(
     )
 }
 
-/// Does an installed hook command still carry the CURRENT binary's pin?
-/// (NRM-089 review M2.) The stored command is parsed for the builder's own
-/// guard shape (`cmd='<escaped pin>';`), the escaping is reversed layer by
-/// layer — the `sh -c` wrapper for gemini/antigravity, then the builder's
-/// single-quote layer — and the extracted pin is compared to the current
-/// canonical exe by EXACT string equality. No extracted pin (legacy or
-/// prefix forms) is stale when the current binary can pin; a pin that
-/// cannot pin (uvx) keeps the prefix/env forms current.
-pub(crate) fn hook_command_pin_current(command: &str) -> bool {
-    let extracted = extract_pinned_command_path(command);
-    match pinned_hcom_binary() {
-        Some(exe) => extracted.as_deref() == Some(exe.as_str()),
-        None => extracted.is_none(),
-    }
-}
-
 /// Reverse one application of [`sh_single_quote`]: a stored body whose
 /// apostrophes appear as the 4-char sequence `'\''`.
 fn sh_unquote_layer(s: &str) -> String {
     s.replace("'\\''", "'")
 }
 
-/// Extract the literal launcher pin from a stored hook command, undoing the
-/// builders' escaping. `None` when the command carries no literal pin
-/// (claude's `${HCOM:-hcom}` env form, the gemini/antigravity prefix forms).
+/// The launcher pin stored in a hook command, for diagnostics: parses the
+/// builder's own guard shape (`cmd='<escaped pin>';`), reversing the
+/// escaping layer by layer — the `sh -c` wrapper for gemini/antigravity,
+/// then the builder's single-quote layer. Not used for currency decisions:
+/// verify compares stored commands byte-equal to what this build generates.
 pub(crate) fn extract_pinned_command_path(command: &str) -> Option<String> {
     let s = command.trim();
     // Layer 1: the gemini/antigravity `sh -c '<script>'` wrapper.
