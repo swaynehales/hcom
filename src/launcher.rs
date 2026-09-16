@@ -1700,6 +1700,10 @@ fn claim_explicit_launch_name(
             .ok()
             .flatten()
             .unwrap_or(serde_json::Value::Null);
+        // DEC-032 follow-up: the dead-row path used to take the name from any
+        // directory. The same project check as the tombstone path applies,
+        // keyed on the row's directory.
+        crate::commands::start::ensure_same_project(name, &row.directory, working_dir)?;
         let displaced_tool = snapshot
             .get("tool")
             .and_then(|v| v.as_str())
@@ -2263,9 +2267,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {
-            if params.claim_name {
-                stamp_launch_claim(db, &instance_name, &process_id, &launch_claim, tool_type)?;
-            }
             instance_binding::initialize_instance_in_position_file(
                 db,
                 &instance_name,
@@ -2286,6 +2287,19 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 None,              // hints
                 Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
             );
+            // DEC-032 follow-up: stamp AFTER the pre-register write, not
+            // before it. The succession event must describe a takeover whose
+            // row actually exists — if pre-registration failed before this
+            // point there is no row, the stale-placeholder reaper never runs
+            // (it only fires on rows), and the ledger would keep a succession
+            // no succession_aborted ever answers. With the stamp here, every
+            // post-pre-register failure (tool spawn dies, claimer never
+            // binds) is already covered by the reaper's succession_aborted
+            // guard, and a failed pre-register leaves no reservation stamp
+            // behind to block a retry.
+            if params.claim_name {
+                stamp_launch_claim(db, &instance_name, &process_id, &launch_claim, tool_type)?;
+            }
             db.set_process_binding(&process_id, "", &instance_name)?;
             if params.claim_name
                 && let Some(cursor) = launch_claim.displaced_last_event_id
@@ -4286,6 +4300,99 @@ mod tests {
             claim_explicit_launch_name(&db, "luna", "owner-other", "/tmp/claim")
                 .unwrap();
         assert_eq!(own, LaunchClaim::default(), "the owning launch passes through");
+    }
+
+    /// Dead-row claim in `dir` for a row stored in `stored_dir`: Ok(tombstoned)
+    /// or Err, exercising the DEC-032 follow-up project check on the dead-row
+    /// path.
+    fn claim_dead_row(
+        db: &crate::db::HcomDb,
+        stored_dir: &std::path::Path,
+        claim_dir: &std::path::Path,
+    ) -> Result<LaunchClaim> {
+        db.update_instance_fields(
+            "luna",
+            &serde_json::json!({ "directory": stored_dir.to_string_lossy() })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        claim_explicit_launch_name(
+            db,
+            "luna",
+            "owner-1",
+            &claim_dir.to_string_lossy(),
+        )
+    }
+
+    fn temp_git_repo(tag: &str, name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-q", "-m", "init"],
+            vec!["worktree", "add", base.path().join("wt").to_str().unwrap()],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = tag;
+        (base, repo)
+    }
+
+    #[test]
+    #[serial]
+    fn launch_claim_dead_row_refused_from_other_project() {
+        let db = launcher_test_db();
+        insert_claim_row(&db, "luna", Some("sid-dead"), true);
+        let (_base_a, repo_a) = temp_git_repo("a", "main");
+        let (_base_b, repo_b) = temp_git_repo("b", "other");
+
+        let err = claim_dead_row(&db, &repo_a, &repo_b).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Refusing to reclaim 'luna'"),
+            "refusal style kept: {msg}"
+        );
+        let root_a = std::fs::canonicalize(&repo_a).unwrap();
+        let root_b = std::fs::canonicalize(&repo_b).unwrap();
+        assert!(
+            msg.contains(&root_a.to_string_lossy().to_string())
+                && msg.contains(&root_b.to_string_lossy().to_string()),
+            "both project roots named: {msg}"
+        );
+        // Refused claims must not have taken the name: the row survives.
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+        assert_eq!(stopped_events(&db, "luna"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn launch_claim_dead_row_allowed_from_worktree_of_own_project() {
+        let db = launcher_test_db();
+        insert_claim_row(&db, "luna", Some("sid-dead"), true);
+        let (_base, repo) = temp_git_repo("a", "main");
+        let wt = repo.parent().unwrap().join("wt");
+
+        let claim = claim_dead_row(&db, &repo, &wt).unwrap();
+        assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-dead"));
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "the dead predecessor row must be gone"
+        );
+        assert_eq!(stopped_events(&db, "luna"), 1);
     }
 
     #[test]

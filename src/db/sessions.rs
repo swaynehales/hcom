@@ -765,19 +765,43 @@ impl HcomDb {
                     .or(Some(serde_json::Value::Null))
             })
             .unwrap_or(serde_json::Value::Null);
+        // The succession the claimer is answering was either a bare-shell
+        // claim (by="start --as" / bare start) or a launch-path claim (by=
+        // "launch", logged at pre-registration); say which, so the reason is
+        // accurate for both origins.
+        let event_by = serde_json::from_str::<serde_json::Value>(&event_data)
+            .ok()
+            .and_then(|v| {
+                v.get("by")
+                    .and_then(|b| b.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let reason = if event_by == "launch" {
+            "first bind after a launch claim"
+        } else {
+            "first bind after a bare-shell claim"
+        };
         let _ = self.log_event(
             "life",
             instance_name,
             &serde_json::json!({
                 "action": "succession_claimer_backfill",
                 "by": "sessionstart",
-                "reason": "first bind after a bare-shell claim",
+                "reason": reason,
                 "displaced_name": instance_name,
                 "displaced_session_id": displaced_session_id,
                 "claimer_session_id": session_id,
                 "backfills_event_id": event_id,
             }),
         );
+        // The launch reservation is consumed the moment its claimer binds —
+        // the stamp's only reader is the placeholder branch of the launch
+        // claim, and that branch is unreachable once a session owns the row.
+        // Exact-key delete; a launch claim with no displaced history logs no
+        // succession and so no backfill, but its stamp is inert there (the
+        // row is bound, not a placeholder).
+        let _ = self.kv_set(&format!("{RESERVATION_OWNER_KEY}{instance_name}"), None);
     }
 
     /// Check if instance has a session binding (hooks active).

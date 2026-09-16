@@ -875,15 +875,68 @@ pub(crate) fn ensure_rebind_compatible(
 ) -> Result<()> {
     // A name is a label, not a tool binding (DEC-030): a stopped name may be
     // reclaimed by any tool. Hijack protection is the liveness gate plus the
-    // directory check below.
-    if !meta.directory.is_empty() && !same_path(&meta.directory, current_dir) {
+    // project check below (DEC-032 follow-up: scoped to the project root, so
+    // a subfolder or a linked worktree of the same repo reclaims the name).
+    ensure_same_project(target_name, &meta.directory, current_dir)
+}
+
+/// The project root of `dir`: the parent of `git rev-parse
+/// --path-format=absolute --git-common-dir` — the main repository, so linked
+/// worktrees resolve to their repo (the same derivation as
+/// docs/operator/hcom-role.zsh and design §1e). `None` when `dir` is not in a
+/// git repository (or git failed for any reason); callers fall back to the
+/// exact-path compare.
+pub(crate) fn project_root_of(dir: &str) -> Option<PathBuf> {
+    if dir.is_empty() {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .args(["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common = String::from_utf8(output.stdout).ok()?;
+    let common = common.trim();
+    if common.is_empty() {
+        return None;
+    }
+    PathBuf::from(common)
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+/// Directory guard for name reclaims: both directories inside the same
+/// project (same git common-dir root) are compatible; if either side is not
+/// in a git repository — including a stored directory that no longer exists —
+/// fall back to the exact-path compare. The refusal names both project roots
+/// when the roots are what differ.
+pub(crate) fn ensure_same_project(name: &str, stored_dir: &str, current_dir: &str) -> Result<()> {
+    if stored_dir.is_empty() {
+        return Ok(());
+    }
+    if let (Some(stored_root), Some(current_root)) =
+        (project_root_of(stored_dir), project_root_of(current_dir))
+    {
+        let stored_root = normalize_path_for_compare(&stored_root.to_string_lossy());
+        let current_root = normalize_path_for_compare(&current_root.to_string_lossy());
+        if stored_root == current_root {
+            return Ok(());
+        }
         bail!(
-            "Refusing to reclaim '{target_name}': latest identity used directory '{}' but current session is '{}'",
-            meta.directory,
+            "Refusing to reclaim '{name}': latest identity belongs to project '{}' but current session is in project '{}'",
+            stored_root.display(),
+            current_root.display()
+        );
+    }
+    if !same_path(stored_dir, current_dir) {
+        bail!(
+            "Refusing to reclaim '{name}': latest identity used directory '{}' but current session is '{}'",
+            stored_dir,
             current_dir
         );
     }
-
     Ok(())
 }
 
@@ -2440,6 +2493,116 @@ mod tests {
             err.to_string().contains("latest identity used directory"),
             "the directory guard stays: {err}"
         );
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A main repository with one linked worktree, both under a temp base.
+    fn temp_project_repo(tag: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("main");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        let wt = base.path().join("wt");
+        git(&repo, &["worktree", "add", wt.to_str().unwrap()]);
+        let _ = tag;
+        (base, repo, wt)
+    }
+
+    #[test]
+    #[serial]
+    fn reclaim_allowed_from_worktree_and_subfolder_of_same_project() {
+        let (_base, repo, wt) = temp_project_repo("same");
+
+        let meta = RebindTargetMetadata {
+            tool: "claude".to_string(),
+            directory: repo.to_string_lossy().to_string(),
+            last_event_id: 5,
+            session_id: "sid-old".to_string(),
+        };
+
+        // A linked worktree of the same repo reclaims the name.
+        ensure_rebind_compatible("role_w", &meta, &wt.to_string_lossy())
+            .expect("a worktree is the same project");
+
+        // So does a plain subfolder.
+        let sub = repo.join("deep/nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        ensure_rebind_compatible("role_w", &meta, &sub.to_string_lossy())
+            .expect("a subfolder is the same project");
+    }
+
+    #[test]
+    #[serial]
+    fn reclaim_refused_across_projects_names_both_roots() {
+        let (_base_a, repo_a, _) = temp_project_repo("proj-a");
+        let (_base_b, repo_b, _) = temp_project_repo("proj-b");
+
+        // The stored directory may itself be a subfolder — the root is what
+        // is compared.
+        let stored = repo_a.join("sub");
+        std::fs::create_dir_all(&stored).unwrap();
+        let meta = RebindTargetMetadata {
+            tool: "claude".to_string(),
+            directory: stored.to_string_lossy().to_string(),
+            last_event_id: 5,
+            session_id: "sid-old".to_string(),
+        };
+
+        let err = ensure_rebind_compatible("role_x", &meta, &repo_b.to_string_lossy())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Refusing to reclaim 'role_x'"),
+            "refusal style kept: {msg}"
+        );
+        // macOS tempdirs sit behind /var → /private/var; the refusal prints
+        // canonicalized roots, so assert against canonicalized paths.
+        let root_a = std::fs::canonicalize(&repo_a).unwrap();
+        let root_b = std::fs::canonicalize(&repo_b).unwrap();
+        assert!(
+            msg.contains(&root_a.to_string_lossy().to_string())
+                && msg.contains(&root_b.to_string_lossy().to_string()),
+            "both project roots named: {msg}"
+        );
+    }
+
+    #[test]
+    fn reclaim_falls_back_to_exact_compare_when_stored_dir_missing() {
+        let gone = tempfile::tempdir().unwrap();
+        let stored = gone.path().join("removed");
+        let meta = RebindTargetMetadata {
+            tool: "claude".to_string(),
+            directory: stored.to_string_lossy().to_string(),
+            last_event_id: 5,
+            session_id: "sid-old".to_string(),
+        };
+
+        // The stored directory no longer exists: no git root on that side,
+        // so the exact-path compare decides.
+        let err = ensure_rebind_compatible("role_g", &meta, "/tmp/nrm053-elsewhere")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("latest identity used directory"),
+            "exact-compare fallback message: {err}"
+        );
+        ensure_rebind_compatible("role_g", &meta, &stored.to_string_lossy())
+            .expect("same path still passes");
     }
 
     #[test]
