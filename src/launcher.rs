@@ -1520,6 +1520,7 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
 pub(crate) struct LaunchClaim {
     pub(crate) displaced_session_id: Option<String>,
     pub(crate) displaced_last_event_id: Option<i64>,
+    pub(crate) displaced_tool: Option<String>,
 }
 
 use crate::db::sessions::{RESERVATION_OWNER_KEY, SUCCESSION_PENDING_KEY};
@@ -1573,6 +1574,12 @@ fn claim_explicit_launch_name(
             .ok()
             .flatten()
             .unwrap_or(serde_json::Value::Null);
+        let displaced_tool = snapshot
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| if row.tool.is_empty() { None } else { Some(row.tool.clone()) });
         db.finalize_instance_stop(
             name,
             row.created_at,
@@ -1588,14 +1595,21 @@ fn claim_explicit_launch_name(
         return Ok(LaunchClaim {
             displaced_session_id: row.session_id.clone().filter(|s| !s.is_empty()),
             displaced_last_event_id: Some(row.last_event_id),
+            displaced_tool,
         });
     }
 
     if let Ok(meta) = crate::commands::start::load_rebind_target_metadata(db, name) {
         crate::commands::start::ensure_rebind_compatible(name, &meta, working_dir)?;
+        let displaced_tool = if meta.tool.is_empty() {
+            None
+        } else {
+            Some(meta.tool)
+        };
         return Ok(LaunchClaim {
             displaced_session_id: Some(meta.session_id).filter(|s| !s.is_empty()),
             displaced_last_event_id: Some(meta.last_event_id),
+            displaced_tool,
         });
     }
 
@@ -1603,21 +1617,40 @@ fn claim_explicit_launch_name(
 }
 
 /// Stamp the owner and the pending-succession record for a claimed name, and
-/// hand the displaced cursor back for the pre-registered row.
-fn stamp_launch_claim(db: &HcomDb, name: &str, owner: &str, claim: &LaunchClaim) -> Result<()> {
+/// log the succession event immediately so all harnesses (including those
+/// without immediate session bindings) have their succession recorded in the ledger.
+fn stamp_launch_claim(
+    db: &HcomDb,
+    name: &str,
+    owner: &str,
+    claim: &LaunchClaim,
+    target_tool: &str,
+) -> Result<()> {
     db.kv_set(&format!("{RESERVATION_OWNER_KEY}{name}"), Some(owner))?;
-    if claim.displaced_session_id.is_some() || claim.displaced_last_event_id.is_some() {
-        db.kv_set(
-            &format!("{SUCCESSION_PENDING_KEY}{name}"),
-            Some(
-                &serde_json::json!({
-                    "displaced_name": name,
-                    "displaced_session_id": claim.displaced_session_id,
-                    "displaced_last_event_id": claim.displaced_last_event_id,
-                })
-                .to_string(),
-            ),
-        )?;
+    let has_history = claim.displaced_session_id.is_some()
+        || claim.displaced_last_event_id.is_some()
+        || claim.displaced_tool.is_some();
+
+    if has_history {
+        // Record succession event immediately at launch pre-registration time.
+        // This guarantees that every harness (claude, opencode, antigravity, codex, gemini)
+        // gets its succession recorded in the ledger, even if no session ID ever binds.
+        let _ = db.log_event(
+            "life",
+            name,
+            &serde_json::json!({
+                "action": "succession",
+                "by": "launch",
+                "reason": "name claimed via launch --instance-name",
+                "from_tool": claim.displaced_tool,
+                "to_tool": target_tool,
+                "displaced_name": name,
+                "displaced_session_id": claim.displaced_session_id,
+                "claimer_session_id": serde_json::Value::Null,
+                "last_event_id": claim.displaced_last_event_id.unwrap_or(0),
+            }),
+        );
+        let _ = db.kv_delete_prefix(&format!("{SUCCESSION_PENDING_KEY}{name}"));
     }
     Ok(())
 }
@@ -2102,7 +2135,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {
             if params.claim_name {
-                stamp_launch_claim(db, &instance_name, &process_id, &launch_claim)?;
+                stamp_launch_claim(db, &instance_name, &process_id, &launch_claim, tool_type)?;
             }
             instance_binding::initialize_instance_in_position_file(
                 db,
@@ -4142,5 +4175,38 @@ mod tests {
         assert_eq!(fabricated, 0, "stale pending record must not fabricate history");
         assert_eq!(db.kv_get("nrm053_succession_pending:luna").unwrap(), None);
         assert_eq!(db.kv_get("nrm053_reservation_owner:luna").unwrap(), None);
+    }
+
+    #[test]
+    fn stamp_launch_claim_logs_succession_event_with_from_and_to_tool() {
+        let db = launcher_test_db();
+        let claim = LaunchClaim {
+            displaced_session_id: Some("sid-old".to_string()),
+            displaced_last_event_id: Some(42),
+            displaced_tool: Some("opencode".to_string()),
+        };
+        stamp_launch_claim(&db, "luna", "owner-1", &claim, "antigravity").unwrap();
+
+        let ev: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = 'luna'
+                   AND data LIKE '%\"action\":\"succession\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ev.contains("\"from_tool\":\"opencode\""), "{ev}");
+        assert!(ev.contains("\"to_tool\":\"antigravity\""), "{ev}");
+        assert!(ev.contains("\"displaced_session_id\":\"sid-old\""), "{ev}");
+        assert!(ev.contains("\"claimer_session_id\":null"), "{ev}");
+        assert!(ev.contains("\"displaced_name\":\"luna\""), "{ev}");
+        assert_eq!(
+            db.kv_get("nrm053_succession_pending:luna").unwrap(),
+            None,
+            "launch writes succession directly to ledger, no pending key left"
+        );
     }
 }

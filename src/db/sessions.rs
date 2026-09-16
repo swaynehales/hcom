@@ -647,6 +647,14 @@ impl HcomDb {
             .get("displaced_last_event_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        let from_tool = parsed
+            .get("from_tool")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let to_tool = parsed
+            .get("to_tool")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         // F2 guard: a pending record only pairs the predecessor with the
         // session the pre-registered row is about to take. If the row is
@@ -674,6 +682,8 @@ impl HcomDb {
                 "action": "succession",
                 "by": "launch",
                 "reason": "reservation promoted at SessionStart",
+                "from_tool": from_tool,
+                "to_tool": to_tool,
                 "displaced_name": instance_name,
                 "displaced_session_id": if displaced_session_id.is_empty() {
                     serde_json::Value::Null
