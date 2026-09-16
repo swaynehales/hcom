@@ -864,6 +864,10 @@ fn start_rebind_opts(
 pub(crate) struct RebindTargetMetadata {
     pub(crate) tool: String,
     pub(crate) directory: String,
+    /// Directory the name was launched or claimed from — recorded once at
+    /// claim/create time (never rewritten by hooks). Empty on legacy rows and
+    /// tombstones; those fall back to `directory`.
+    pub(crate) launch_directory: String,
     pub(crate) last_event_id: i64,
     pub(crate) session_id: String,
 }
@@ -877,34 +881,105 @@ pub(crate) fn ensure_rebind_compatible(
     // reclaimed by any tool. Hijack protection is the liveness gate plus the
     // project check below (DEC-032 follow-up: scoped to the project root, so
     // a subfolder or a linked worktree of the same repo reclaims the name).
-    ensure_same_project(target_name, &meta.directory, current_dir)
+    // The stored side is the LAUNCH directory (operator ruling 2026-09-16):
+    // instances.directory tracks the harness's cwd via hooks and can drift
+    // into a nested repo, so it is only the fallback for legacy rows.
+    let stored = if meta.launch_directory.is_empty() {
+        &meta.directory
+    } else {
+        &meta.launch_directory
+    };
+    ensure_same_project(target_name, stored, current_dir)
 }
 
-/// The project root of `dir`: the parent of `git rev-parse
-/// --path-format=absolute --git-common-dir` — the main repository, so linked
-/// worktrees resolve to their repo (the same derivation as
-/// docs/operator/hcom-role.zsh and design §1e). `None` when `dir` is not in a
-/// git repository (or git failed for any reason); callers fall back to the
-/// exact-path compare.
+/// The project root of `dir` (review F1-F4 hardened).
+///
+/// Rule, in order:
+/// 1. The common dir's basename is `.git` — a main repo or a linked worktree;
+///    the root is the common dir's parent.
+/// 2. Otherwise `git rev-parse --show-toplevel` when it succeeds — a
+///    submodule's working tree (its common dir lives under the superproject's
+///    `.git/modules`, which would wrongly resolve to the superproject).
+/// 3. Otherwise the common dir itself — a bare repository (`r1.git`), which
+///    IS the project.
+///
+/// `None` when `dir` is not in a git repository (or git failed / timed out);
+/// callers fall back to the exact-path compare.
 pub(crate) fn project_root_of(dir: &str) -> Option<PathBuf> {
     if dir.is_empty() {
         return None;
     }
-    let output = std::process::Command::new("git")
-        .args(["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
+    let common = git_query(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = PathBuf::from(common);
+    if common.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        return common.parent().map(|p| p.to_path_buf());
+    }
+    if let Some(top) = git_query(dir, &["rev-parse", "--show-toplevel"]) {
+        return Some(PathBuf::from(top));
+    }
+    Some(common)
+}
+
+/// Run a git query in `dir` and return trimmed stdout.
+///
+/// The claimer's git environment is stripped first: an exported GIT_DIR /
+/// GIT_WORK_TREE (etc.) must not decide which project a directory belongs to
+/// (review F1). The subprocess is bounded by a short poll timeout — a dead
+/// mount must degrade to the exact-path compare, not hang the claim (review
+/// F4). Output of these queries is a single path, so the piped stdout cannot
+/// fill and block the child.
+fn git_query(dir: &str, args: &[&str]) -> Option<String> {
+    use std::process::{Command, Stdio};
+    const STRIPPED_GIT_ENV: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    for var in STRIPPED_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = String::new();
+    use std::io::Read;
+    child
+        .stdout
+        .take()?
+        .read_to_string(&mut stdout)
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-    let common = String::from_utf8(output.stdout).ok()?;
-    let common = common.trim();
-    if common.is_empty() {
-        return None;
-    }
-    PathBuf::from(common)
-        .parent()
-        .map(|p| p.to_path_buf())
 }
 
 /// Directory guard for name reclaims: both directories inside the same
@@ -954,6 +1029,7 @@ pub(crate) fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<Reb
         return Ok(RebindTargetMetadata {
             tool: inst.tool,
             directory: inst.directory,
+            launch_directory: inst.launch_directory,
             last_event_id: inst.last_event_id,
             session_id: inst.session_id.unwrap_or_default(),
         });
@@ -981,6 +1057,11 @@ pub(crate) fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<Reb
                     .to_string(),
                 directory: snapshot
                     .get("directory")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                launch_directory: snapshot
+                    .get("launch_directory")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
@@ -2476,6 +2557,7 @@ mod tests {
     #[test]
     fn test_reclaim_across_tools_is_allowed() {
         let meta = RebindTargetMetadata {
+            launch_directory: String::new(),
             tool: "opencode".to_string(),
             directory: "/tmp/nrm053-xtool".to_string(),
             last_event_id: 11,
@@ -2509,6 +2591,23 @@ mod tests {
         );
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            unsafe { std::env::set_var(key, value) };
+            EnvVarGuard { key }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
+
     /// A main repository with one linked worktree, both under a temp base.
     fn temp_project_repo(tag: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let base = tempfile::tempdir().unwrap();
@@ -2530,6 +2629,7 @@ mod tests {
         let (_base, repo, wt) = temp_project_repo("same");
 
         let meta = RebindTargetMetadata {
+            launch_directory: String::new(),
             tool: "claude".to_string(),
             directory: repo.to_string_lossy().to_string(),
             last_event_id: 5,
@@ -2558,6 +2658,7 @@ mod tests {
         let stored = repo_a.join("sub");
         std::fs::create_dir_all(&stored).unwrap();
         let meta = RebindTargetMetadata {
+            launch_directory: String::new(),
             tool: "claude".to_string(),
             directory: stored.to_string_lossy().to_string(),
             last_event_id: 5,
@@ -2587,6 +2688,7 @@ mod tests {
         let gone = tempfile::tempdir().unwrap();
         let stored = gone.path().join("removed");
         let meta = RebindTargetMetadata {
+            launch_directory: String::new(),
             tool: "claude".to_string(),
             directory: stored.to_string_lossy().to_string(),
             last_event_id: 5,
@@ -2603,6 +2705,127 @@ mod tests {
         );
         ensure_rebind_compatible("role_g", &meta, &stored.to_string_lossy())
             .expect("same path still passes");
+    }
+
+    #[test]
+    #[serial]
+    fn reclaim_uses_launch_directory_not_drifted_directory() {
+        let (_base, repo, _wt) = temp_project_repo("drift");
+        let nested = repo.parent().unwrap().join("drift-nested-repo");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+
+        // The row's display directory drifted into the nested repo via hook
+        // updates; the launch directory still names the project root.
+        let meta = RebindTargetMetadata {
+            launch_directory: repo.to_string_lossy().to_string(),
+            tool: "claude".to_string(),
+            directory: nested.to_string_lossy().to_string(),
+            last_event_id: 5,
+            session_id: "sid-old".to_string(),
+        };
+
+        ensure_rebind_compatible("role_l", &meta, &repo.to_string_lossy())
+            .expect("the launch directory, not the drifted directory, is compared");
+        let err = ensure_rebind_compatible("role_l", &meta, "/tmp/nrm053-elsewhere")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(&repo.to_string_lossy().to_string())
+                || err.to_string().contains(&std::fs::canonicalize(&repo).unwrap().to_string_lossy().to_string()),
+            "refusal names the launch project: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn project_root_ignores_claimer_git_env() {
+        let (_base_a, repo_a, _) = temp_project_repo("env-a");
+        let (_base_b, repo_b, _) = temp_project_repo("env-b");
+
+        let a_root = std::fs::canonicalize(&repo_a).unwrap();
+        let b_root = std::fs::canonicalize(&repo_b).unwrap();
+
+        // A foreign GIT_DIR must not claim repo_a's directory...
+        let guard_dir = EnvVarGuard::set("GIT_DIR", b_root.join(".git").to_str().unwrap());
+        assert_eq!(
+            project_root_of(&repo_a.to_string_lossy()),
+            Some(a_root.clone()),
+            "GIT_DIR from the claimer's env does not decide the project"
+        );
+        // ...nor leak into the bare-repo and fallback paths.
+        assert_eq!(
+            project_root_of(&b_root.join("nonexistent").to_string_lossy()),
+            None,
+            "a directory outside git still falls back"
+        );
+        drop(guard_dir);
+
+        let guard_ceiling =
+            EnvVarGuard::set("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
+        assert_eq!(project_root_of(&repo_b.to_string_lossy()), Some(b_root));
+        drop(guard_ceiling);
+    }
+
+    #[test]
+    #[serial]
+    fn project_root_bare_repo_is_its_own_project() {
+        let base = tempfile::tempdir().unwrap();
+        let bares = base.path().join("bares");
+        std::fs::create_dir_all(&bares).unwrap();
+        let r1 = bares.join("r1.git");
+        let r2 = bares.join("r2.git");
+        git(&bares, &["init", "-q", "--bare", r1.to_str().unwrap()]);
+        git(&bares, &["init", "-q", "--bare", r2.to_str().unwrap()]);
+
+        assert_eq!(
+            project_root_of(&r1.to_string_lossy()),
+            Some(std::fs::canonicalize(&r1).unwrap()),
+            "a bare repo is its own project, not its parent folder"
+        );
+        assert_ne!(
+            project_root_of(&r1.to_string_lossy()),
+            project_root_of(&r2.to_string_lossy()),
+            "two bare repos under one folder stay distinct projects"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn project_root_submodule_is_the_submodule_tree() {
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("sub");
+        let super_dir = base.path().join("super");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&super_dir).unwrap();
+        for repo in [&sub, &super_dir] {
+            git(repo, &["init", "-q"]);
+            git(repo, &["config", "user.email", "t@example.com"]);
+            git(repo, &["config", "user.name", "t"]);
+            git(repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        }
+        git(
+            &super_dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.to_str().unwrap(),
+                "sub3",
+            ],
+        );
+
+        let sub3 = super_dir.join("sub3");
+        assert_eq!(
+            project_root_of(&sub3.to_string_lossy()),
+            Some(std::fs::canonicalize(&sub3).unwrap()),
+            "a submodule is its own project, not the superproject"
+        );
+        assert_eq!(
+            project_root_of(&super_dir.to_string_lossy()),
+            Some(std::fs::canonicalize(&super_dir).unwrap()),
+            "the superproject still resolves to itself"
+        );
     }
 
     #[test]
