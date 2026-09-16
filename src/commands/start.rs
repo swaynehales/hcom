@@ -38,6 +38,11 @@ pub struct StartArgs {
     /// Rebind to a different instance name
     #[arg(long = "as")]
     pub as_name: Option<String>,
+    /// Rebind to the derived role name (design §1e): `--role <value>` for
+    /// bare-shell claims — the name `hcom <tool> --role <value>` would
+    /// launch, claimed exactly like `--as <name>`
+    #[arg(long = "as-role")]
+    pub as_role: Option<String>,
     /// Adopt a name with no row and no tombstone (D6 escape hatch; the
     /// resulting claim is provisional)
     #[arg(long = "adopt-unknown")]
@@ -49,6 +54,43 @@ pub struct StartArgs {
     /// Recover orphaned PTY process by name or PID
     #[arg(long)]
     pub orphan: Option<String>,
+}
+
+/// Resolve `--as-role` into the derived role name and run the conflict
+/// checks; `--as` passes through untouched. `--as-role` mirrors `--as`:
+/// the name is derived (design §1e) and then claimed exactly like
+/// `--as <name>`.
+fn resolve_start_as_role(
+    db: &HcomDb,
+    as_role: &Option<String>,
+    as_name: &Option<String>,
+    flags: &GlobalFlags,
+) -> Result<Option<String>> {
+    let Some(role) = as_role else {
+        return Ok(as_name.clone());
+    };
+    if as_name.is_some() {
+        bail!("--as-role cannot be combined with --as");
+    }
+    if flags.name.is_some() {
+        bail!("--as-role cannot be combined with --name");
+    }
+    if role.trim().is_empty() {
+        bail!("--as-role requires a value");
+    }
+    if crate::runtime_env::normalize_composed_name(role).is_empty() {
+        bail!("--as-role '{role}' normalizes to empty — supply a role of [a-z0-9_] after normalization");
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let derived = crate::runtime_env::derive_role_instance_name(role, &cwd);
+    if derived.is_empty() {
+        bail!(
+            "--as-role '{role}' derives an empty name — supply a role that normalizes to [a-z0-9_]"
+        );
+    }
+    let valid = identity::validate_claim_name(db, &derived)
+        .map_err(|e| anyhow::anyhow!("--as-role '{role}': {e}"))?;
+    Ok(Some(valid))
 }
 
 /// Claim-policy flags threaded into the rebind/claim path.
@@ -88,13 +130,14 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     };
 
     let orphan_target = start_args.orphan;
-    let rebind_target = start_args.as_name;
     let claim_opts = ClaimOptions {
         adopt_unknown: start_args.adopt_unknown,
         force: start_args.force,
     };
 
     let db = HcomDb::open()?;
+
+    let rebind_target = resolve_start_as_role(&db, &start_args.as_role, &start_args.as_name, flags)?;
     let hcom_dir = paths::hcom_dir();
 
     let ctx = HcomContext::from_os();
@@ -933,7 +976,7 @@ pub(crate) fn project_root_of(dir: &str) -> Option<PathBuf> {
 /// mount must degrade to the exact-path compare, not hang the claim (review
 /// F4). Output of these queries is a single path, so the piped stdout cannot
 /// fill and block the child.
-fn git_query(dir: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn git_query(dir: &str, args: &[&str]) -> Option<String> {
     use std::process::{Command, Stdio};
     const STRIPPED_GIT_ENV: &[&str] = &[
         "GIT_DIR",

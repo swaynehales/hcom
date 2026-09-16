@@ -22,6 +22,7 @@ pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 10;
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let (count, tool, hcom_flags, tool_args) = parse_launch_argv(argv)?;
+    let hcom_flags = resolve_launch_role(hcom_flags, flags)?;
     let launch_tool = LaunchTool::from_str(&tool)?;
 
     // Count validation
@@ -453,6 +454,50 @@ pub(crate) struct HcomLaunchFlags {
     pub batch_id: Option<String>,
     pub dir: Option<String>,
     pub instance_name: Option<String>,
+    pub role: Option<String>,
+}
+
+/// Resolve `--role` into the derived, validated instance name (NRM-053
+/// phase 2, design §1e): behaves exactly as if `--instance-name <derived>`
+/// had been passed. `--role` conflicts with `--instance-name` and the
+/// global `--name`; an empty role, or one that normalizes to an empty
+/// name, is an error.
+fn resolve_launch_role(
+    mut hcom_flags: HcomLaunchFlags,
+    global: &GlobalFlags,
+) -> Result<HcomLaunchFlags> {
+    let Some(ref role) = hcom_flags.role else {
+        return Ok(hcom_flags);
+    };
+    if hcom_flags.instance_name.is_some() {
+        bail!("--role cannot be combined with --instance-name");
+    }
+    if global.name.is_some() {
+        bail!("--role cannot be combined with --name");
+    }
+    if role.trim().is_empty() {
+        bail!("--role requires a value");
+    }
+    if crate::runtime_env::normalize_composed_name(role).is_empty() {
+        bail!("--role '{role}' normalizes to empty — supply a role of [a-z0-9_] after normalization");
+    }
+    let cwd = hcom_flags
+        .dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    let derived = crate::runtime_env::derive_role_instance_name(role, &cwd);
+    if derived.is_empty() {
+        bail!(
+            "--role '{role}' derives an empty name — supply a role that normalizes to [a-z0-9_]"
+        );
+    }
+    let db = HcomDb::open()?;
+    let valid = crate::identity::validate_claim_name(&db, &derived)
+        .map_err(|e| anyhow::anyhow!("--role '{role}': {e}"))?;
+    hcom_flags.instance_name = Some(valid);
+    hcom_flags.role = None;
+    Ok(hcom_flags)
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -620,9 +665,18 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--role=") {
+            flags.role = Some(args[i][7..].to_string());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--instance-name" if i + 1 < args.len() => {
                 flags.instance_name = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--role" if i + 1 < args.len() => {
+                flags.role = Some(args[i + 1].clone());
                 i += 2;
             }
             "--tag" if i + 1 < args.len() => {
