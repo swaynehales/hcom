@@ -653,6 +653,42 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
+                // If this placeholder claimed a name via succession that never bound a session,
+                // log a succession_aborted life event referencing the succession event id.
+                if let Ok(ev_id) = db.conn().query_row(
+                    "SELECT id FROM events
+                     WHERE type = 'life' AND instance = ?
+                       AND data LIKE '%\"action\":\"succession\"%'
+                       AND data LIKE '%\"claimer_session_id\":null%'
+                     ORDER BY id DESC LIMIT 1",
+                    [&data.name],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    let answered: i64 = db
+                        .conn()
+                        .query_row(
+                            "SELECT COUNT(*) FROM events
+                             WHERE type = 'life' AND instance = ? AND id > ?
+                               AND (data LIKE '%succession_claimer_backfill%' OR data LIKE '%succession_aborted%')",
+                            rusqlite::params![&data.name, ev_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if answered == 0 {
+                        let _ = db.log_event(
+                            "life",
+                            &data.name,
+                            &serde_json::json!({
+                                "action": "succession_aborted",
+                                "by": "system",
+                                "reason": "claimed placeholder reaped before session bind",
+                                "displaced_name": data.name,
+                                "succession_event_id": ev_id,
+                            }),
+                        );
+                    }
+                }
+
                 crate::hooks::common::stop_placeholder_instance(
                     db,
                     &data.name,
@@ -662,17 +698,23 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                 // F2 — the launch never reached SessionStart; consume its
                 // claim stamps so a foreign --instance-name is not refused
                 // for a dead reservation and no pending succession survives
-                // the row.
-                let _ = db.kv_delete_prefix(&format!(
-                    "{}{}",
-                    crate::db::sessions::SUCCESSION_PENDING_KEY,
-                    data.name
-                ));
-                let _ = db.kv_delete_prefix(&format!(
-                    "{}{}",
-                    crate::db::sessions::RESERVATION_OWNER_KEY,
-                    data.name
-                ));
+                // the row. Exact-key deletes.
+                let _ = db.kv_set(
+                    &format!(
+                        "{}{}",
+                        crate::db::sessions::SUCCESSION_PENDING_KEY,
+                        data.name
+                    ),
+                    None,
+                );
+                let _ = db.kv_set(
+                    &format!(
+                        "{}{}",
+                        crate::db::sessions::RESERVATION_OWNER_KEY,
+                        data.name
+                    ),
+                    None,
+                );
                 deleted += 1;
             }
         }
@@ -1394,6 +1436,89 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_placeholders(&db);
         assert_eq!(deleted, 0);
         assert!(db.get_instance_full("real").unwrap().is_some());
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_stale_claimed_placeholder_logs_aborted_and_preserves_sibling() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // 1. Plant sibling keys that share the prefix "claimed"
+        db.kv_set("nrm053_succession_pending:claimed_x", Some("pending-sibling"))
+            .unwrap();
+        db.kv_set("nrm053_reservation_owner:claimed_x", Some("owner-sibling"))
+            .unwrap();
+
+        // 2. Setup claimed placeholder
+        db.kv_set("nrm053_succession_pending:claimed", Some("pending-claimed"))
+            .unwrap();
+        db.kv_set("nrm053_reservation_owner:claimed", Some("owner-claimed"))
+            .unwrap();
+
+        let old_time = now_epoch_f64() - 200.0;
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("claimed"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(old_time));
+        db.save_instance_named("claimed", &data).unwrap();
+
+        // Log succession event with claimer_session_id: null
+        let _ = db.log_event(
+            "life",
+            "claimed",
+            &serde_json::json!({
+                "action": "succession",
+                "by": "launch",
+                "reason": "name claimed via launch --instance-name",
+                "from_tool": "opencode",
+                "to_tool": "claude",
+                "displaced_name": "claimed",
+                "displaced_session_id": "sid-prev",
+                "claimer_session_id": serde_json::Value::Null,
+                "last_event_id": 42,
+            }),
+        );
+        let succ_id: i64 = db
+            .conn()
+            .query_row(
+                "SELECT id FROM events WHERE type = 'life' AND instance = 'claimed' AND data LIKE '%\"action\":\"succession\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // 3. Run cleanup
+        let deleted = cleanup_stale_placeholders(&db);
+        assert_eq!(deleted, 1);
+        assert!(db.get_instance_full("claimed").unwrap().is_none());
+
+        // 4. Verify succession_aborted event referencing succ_id
+        let aborted: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = 'claimed' AND data LIKE '%\"action\":\"succession_aborted\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(aborted.contains(&format!("\"succession_event_id\":{succ_id}")), "{aborted}");
+
+        // 5. Verify exact-key delete: sibling keys must survive
+        assert_eq!(
+            db.kv_get("nrm053_succession_pending:claimed_x").unwrap().as_deref(),
+            Some("pending-sibling"),
+            "sibling pending record must not be wiped by reaping claimed"
+        );
+        assert_eq!(
+            db.kv_get("nrm053_reservation_owner:claimed_x").unwrap().as_deref(),
+            Some("owner-sibling"),
+            "sibling reservation owner must not be wiped by reaping claimed"
+        );
+        assert_eq!(db.kv_get("nrm053_succession_pending:claimed").unwrap(), None);
+        assert_eq!(db.kv_get("nrm053_reservation_owner:claimed").unwrap(), None);
 
         cleanup(path);
     }

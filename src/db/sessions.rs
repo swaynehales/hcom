@@ -666,9 +666,11 @@ impl HcomDb {
             && !bound.is_empty()
             && bound != session_id
         {
-            let _ = self.kv_delete_prefix(&key);
-            let _ =
-                self.kv_delete_prefix(&format!("{RESERVATION_OWNER_KEY}{instance_name}"));
+            let _ = self.kv_set(&key, None);
+            let _ = self.kv_set(
+                &format!("{RESERVATION_OWNER_KEY}{instance_name}"),
+                None,
+            );
             return;
         }
 
@@ -694,8 +696,8 @@ impl HcomDb {
                 "last_event_id": displaced_last_event_id,
             }),
         );
-        let _ = self.kv_delete_prefix(&key);
-        let _ = self.kv_delete_prefix(&format!("{RESERVATION_OWNER_KEY}{instance_name}"));
+        let _ = self.kv_set(&key, None);
+        let _ = self.kv_set(&format!("{RESERVATION_OWNER_KEY}{instance_name}"), None);
     }
 
     /// F3 — backfill the claimer of a bare-shell succession.
@@ -728,7 +730,7 @@ impl HcomDb {
             .query_row(
                 "SELECT COUNT(*) FROM events
                  WHERE type = 'life' AND instance = ? AND id > ?
-                   AND data LIKE '%succession_claimer_backfill%'",
+                   AND (data LIKE '%succession_claimer_backfill%' OR data LIKE '%succession_aborted%')",
                 params![instance_name, event_id],
                 |r| r.get(0),
             )

@@ -1635,7 +1635,7 @@ fn stamp_launch_claim(
         // Record succession event immediately at launch pre-registration time.
         // This guarantees that every harness (claude, opencode, antigravity, codex, gemini)
         // gets its succession recorded in the ledger, even if no session ID ever binds.
-        let _ = db.log_event(
+        db.log_event(
             "life",
             name,
             &serde_json::json!({
@@ -1649,8 +1649,8 @@ fn stamp_launch_claim(
                 "claimer_session_id": serde_json::Value::Null,
                 "last_event_id": claim.displaced_last_event_id.unwrap_or(0),
             }),
-        );
-        let _ = db.kv_delete_prefix(&format!("{SUCCESSION_PENDING_KEY}{name}"));
+        )?;
+        let _ = db.kv_set(&format!("{SUCCESSION_PENDING_KEY}{name}"), None);
     }
     Ok(())
 }
@@ -4208,5 +4208,112 @@ mod tests {
             None,
             "launch writes succession directly to ledger, no pending key left"
         );
+    }
+
+    #[test]
+    fn stamp_launch_claim_preserves_sibling_pending_and_owner_keys() {
+        let db = launcher_test_db();
+        // Plant sibling keys that share the prefix "luna"
+        db.kv_set("nrm053_succession_pending:luna_x", Some("pending-sibling"))
+            .unwrap();
+        db.kv_set("nrm053_reservation_owner:luna_x", Some("owner-sibling"))
+            .unwrap();
+
+        let claim = LaunchClaim {
+            displaced_session_id: Some("sid-old".to_string()),
+            displaced_last_event_id: Some(42),
+            displaced_tool: Some("opencode".to_string()),
+        };
+        stamp_launch_claim(&db, "luna", "owner-luna", &claim, "antigravity").unwrap();
+
+        // Exact-key delete: sibling keys must survive
+        assert_eq!(
+            db.kv_get("nrm053_succession_pending:luna_x").unwrap().as_deref(),
+            Some("pending-sibling"),
+            "sibling pending record must not be wiped by claiming luna"
+        );
+        assert_eq!(
+            db.kv_get("nrm053_reservation_owner:luna_x").unwrap().as_deref(),
+            Some("owner-sibling"),
+            "sibling reservation owner must not be wiped by claiming luna"
+        );
+        assert_eq!(db.kv_get("nrm053_succession_pending:luna").unwrap(), None);
+        assert_eq!(
+            db.kv_get("nrm053_reservation_owner:luna").unwrap().as_deref(),
+            Some("owner-luna")
+        );
+    }
+
+    #[test]
+    fn test_claude_shaped_claim_end_to_end_succession_then_backfill() {
+        let db = launcher_test_db();
+        // 1. Stopped instance held by opencode
+        let claim = LaunchClaim {
+            displaced_session_id: Some("sid-oc-old".to_string()),
+            displaced_last_event_id: Some(42),
+            displaced_tool: Some("opencode".to_string()),
+        };
+
+        // 2. Launch claims name as claude: succession logged immediately with claimer_session_id: null
+        stamp_launch_claim(&db, "nova", "owner-claude", &claim, "claude").unwrap();
+
+        let (succ_id, succ_data): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT id, data FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"succession\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(succ_data.contains("\"from_tool\":\"opencode\""), "{succ_data}");
+        assert!(succ_data.contains("\"to_tool\":\"claude\""), "{succ_data}");
+        assert!(succ_data.contains("\"claimer_session_id\":null"), "{succ_data}");
+        assert!(succ_data.contains("\"displaced_session_id\":\"sid-oc-old\""), "{succ_data}");
+
+        // 3. Claude binds at SessionStart: backfill logged, primary event unchanged
+        insert_claim_row(&db, "nova", None, true);
+        db.rebind_instance_session("nova", "sess-claude-new").unwrap();
+
+        let (back_id, back_data): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT id, data FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"succession_claimer_backfill\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(back_id > succ_id);
+        assert!(back_data.contains("\"claimer_session_id\":\"sess-claude-new\""), "{back_data}");
+        assert!(back_data.contains(&format!("\"backfills_event_id\":{succ_id}")), "{back_data}");
+
+        // Primary succession event is unchanged (append-only)
+        let primary_after: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE id = ?",
+                [succ_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(succ_data, primary_after);
+
+        // Exactly one succession event and one backfill event exist
+        let total_succession: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"succession\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_succession, 1);
     }
 }
