@@ -1344,6 +1344,8 @@ pub enum VerifyFailReason {
         hook_type: String,
         cmd_suffix: String,
     },
+    #[error("hook type '{hook_type}': pinned launcher binary is stale (hooks were written by a different hcom build); re-run setup to re-pin")]
+    HookPinStale { hook_type: String },
     #[error("hook type '{0}': hcom entry has 'type' != \"command\"")]
     HookTypeFieldNotCommand(String),
     #[error("hook type '{hook_type}' name mismatch: expected {expected:?}, got {actual:?}")]
@@ -1405,6 +1407,19 @@ pub enum SetupError {
 /// match what actually executes it.
 fn hook_command(hcom_cmd: &str, cmd_suffix: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    // NRM-089 M1: a literal pin (absolute path, no spaces — the only form
+    // pinned_hcom_command produces) gets the three-way guard shared with the
+    // claude and antigravity builders; prefix forms keep the legacy shape.
+    if hcom_cmd.contains('/') && !hcom_cmd.contains(' ') {
+        let script = crate::runtime_env::pinned_hook_script(hcom_cmd, cmd_suffix, None, None);
+        if cfg!(windows) {
+            let warn = "echo hcom hook: pinned binary missing; using hcom from PATH 1>&2";
+            return format!(
+                "if exist \"{hcom_cmd}\" (\"{hcom_cmd}\" {cmd_suffix}) else (where hcom >nul 2>nul && ({warn} && hcom {cmd_suffix}) || exit /b 0)"
+            );
+        }
+        return format!("sh -c {}", crate::runtime_env::sh_single_quote(&script));
+    }
     if cfg!(windows) {
         // hcom_cmd/cmd_suffix are always fixed hcom invocations (never user input),
         // so no quoting is needed here; if that ever changes, note that PowerShell
@@ -1633,6 +1648,13 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> Result<(), 
                         return Err(VerifyFailReason::HookCommandMissing {
                             hook_type: hook_type.to_string(),
                             cmd_suffix: cmd_suffix.to_string(),
+                        });
+                    }
+                    // NRM-089 M2: a pin written by a different hcom build is
+                    // stale — report not-installed so setup rewrites it.
+                    if !crate::runtime_env::hook_command_pin_current(command) {
+                        return Err(VerifyFailReason::HookPinStale {
+                            hook_type: hook_type.to_string(),
                         });
                     }
                     found = true;
@@ -2023,8 +2045,12 @@ mod tests {
                             "hook must invoke the launcher's own binary: {cmd}"
                         );
                         assert!(
-                            !cmd.contains("exec hcom "),
-                            "the pinned form must not PATH-resolve hcom: {cmd}"
+                            cmd.contains("[ -x \"$cmd\" ]"),
+                            "the pinned form carries the exists-guard: {cmd}"
+                        );
+                        assert!(
+                            cmd.contains("is missing; using hcom from PATH"),
+                            "the guard names the missing pin on the PATH fallback: {cmd}"
                         );
                         pinned += 1;
                     }
@@ -2563,21 +2589,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_verify_accepts_alternate_hcom_prefix() {
+    fn test_verify_rejects_stale_pins() {
         let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
 
         assert!(setup_gemini_hooks(false));
 
-        let mut settings = read_json(&settings_path);
-        let (hook_type, _, cmd_suffix, _, _) = GEMINI_HOOK_CONFIGS[0];
-        settings["hooks"][hook_type][0]["hooks"][0]["command"] =
-            Value::String(format!("uvx hcom {cmd_suffix}"));
-        std::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(&settings).unwrap(),
-        )
-        .unwrap();
+        // NRM-089 M2: any stored pin that is not the current binary — a
+        // prefix form or a pin from another build — is stale and must fail
+        // verify so setup rewrites (re-pins) it.
+        for stale in [
+            format!("uvx hcom {}", GEMINI_HOOK_CONFIGS[0].2),
+            format!(
+                "sh -c 'command -v /opt/old-hcom >/dev/null 2>&1 && exec /opt/old-hcom {} || exit 0'",
+                GEMINI_HOOK_CONFIGS[0].2
+            ),
+        ] {
+            let mut settings = read_json(&settings_path);
+            let (hook_type, _, cmd_suffix, _, _) = GEMINI_HOOK_CONFIGS[0];
+            settings["hooks"][hook_type][0]["hooks"][0]["command"] = Value::String(stale.clone());
+            std::fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+            let result = verify_hooks_at(&settings_path, false);
+            assert!(result.is_err(), "stale pin must fail verify: {stale}");
+        }
 
+        // The current binary's own pin still verifies.
+        assert!(setup_gemini_hooks(false));
         assert!(verify_hooks_at(&settings_path, false).is_ok());
 
         drop(_guard);

@@ -2910,11 +2910,10 @@ fn build_hook_entry_command(cmd_suffix: &str) -> String {
         })
         .unwrap_or_default();
     if !exe.is_empty() && exe.contains('/') {
-        let quoted = format!("'{}'", exe.replace('\'', "'\\''"));
-        format!(
-            "cmd={quoted}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
-            cmd_suffix
-        )
+        // Pinned form (NRM-089 M1, shared with the gemini/antigravity
+        // builders): exec the pin while it exists, fall back to PATH hcom
+        // with a warning naming the missing pin, else exit 0.
+        crate::runtime_env::pinned_hook_script(&exe, cmd_suffix, None, None)
     } else {
         format!(
             "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
@@ -3185,6 +3184,8 @@ pub enum VerifyFailReason {
     HookTimeoutMissing { hook_type: String },
     #[error("duplicate hcom hook entry for hook type '{0}'")]
     HookDuplicated(String),
+    #[error("hook type '{hook_type}': pinned launcher binary is stale (hooks were written by a different hcom build); re-run setup to re-pin")]
+    HookPinStale { hook_type: String },
     #[error("HCOM env var not set in settings.json")]
     HcomEnvMissing,
     #[error("'permissions.allow' missing or not an array")]
@@ -3391,6 +3392,14 @@ fn verify_claude_hooks_inner(
                 if has_hcom && command.contains(cmd_suffix) {
                     if hcom_hook_found {
                         return Err(VerifyFailReason::HookDuplicated(hook_type.to_string()));
+                    }
+
+                    // NRM-089 M2: a pin written by a different hcom build is
+                    // stale — report not-installed so setup rewrites it.
+                    if !crate::runtime_env::hook_command_pin_current(command) {
+                        return Err(VerifyFailReason::HookPinStale {
+                            hook_type: hook_type.to_string(),
+                        });
                     }
 
                     if expected_timeout.is_some()
@@ -4318,16 +4327,25 @@ mod tests {
     fn test_build_hook_entry_command_avoids_nested_shell() {
         let command = build_hook_entry_command("poll");
         // The resolved launcher binary is embedded literally; the env-var
-        // form only remains when the path cannot be resolved.
+        // form only remains when the path cannot be resolved. NRM-089 M1:
+        // the pinned form is the shared three-way guard.
         assert!(
             !command.starts_with("sh -c"),
             "the command must stay inline: {command}"
         );
-        assert!(command.contains("exec $cmd poll || exit 0"), "{command}");
         assert!(
-            command.starts_with("cmd=") && command.contains("command -v \"${cmd%% *}\""),
+            command.starts_with("cmd='") && command.contains("[ -x \"$cmd\" ]"),
+            "the pinned form carries the exists-guard: {command}"
+        );
+        assert!(
+            command.contains("exec \"$cmd\" poll"),
             "{command}"
         );
+        assert!(
+            command.contains("is missing; using hcom from PATH"),
+            "the guard names the missing pin on the PATH fallback: {command}"
+        );
+        assert!(command.ends_with("else exit 0; fi"), "{command}");
     }
 
     #[test]
@@ -4539,13 +4557,15 @@ mod tests {
 
         // Can't call setup_claude_hooks directly (uses get_claude_settings_path),
         // but we can test the verify path with a hand-built settings file.
-        let hook_cmd = "${HCOM}";
+        // NRM-089 M2: fixtures use the current builder form — a pin the
+        // verify path accepts. The pre-pin "${HCOM}" fixture shape is now a
+        // stale install by definition.
         let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
 
         for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
             let mut hook_entry = serde_json::json!({
                 "type": "command",
-                "command": format!("{} {}", hook_cmd, cmd_suffix),
+                "command": build_hook_entry_command(cmd_suffix),
             });
             if let Some(t) = timeout {
                 hook_entry["timeout"] = serde_json::json!(t);
@@ -4603,13 +4623,15 @@ mod tests {
         new_timeout: Option<u64>,
         include_permissions: bool,
     ) {
-        let hook_cmd = "${HCOM}";
+        // NRM-089 M2: fixtures use the current builder form — a pin the
+        // verify path accepts. The pre-pin "${HCOM}" fixture shape is now a
+        // stale install by definition.
         let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
 
         for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
             let mut hook_entry = serde_json::json!({
                 "type": "command",
-                "command": format!("{} {}", hook_cmd, cmd_suffix),
+                "command": build_hook_entry_command(cmd_suffix),
             });
             if timeout.is_some()
                 && let Some(t) = new_timeout
