@@ -4107,4 +4107,41 @@ mod tests {
             .unwrap();
         assert_eq!(before, after);
     }
+
+    #[test]
+    fn promotion_ignores_stale_pending_record_when_row_rebound_elsewhere() {
+        let db = launcher_test_db();
+        db.kv_set(
+            "nrm053_succession_pending:luna",
+            Some(
+                &serde_json::json!({
+                    "displaced_name": "luna",
+                    "displaced_session_id": "sid-ancient",
+                    "displaced_last_event_id": 21
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        insert_claim_row(&db, "luna", Some("sid-current-owner"), true);
+
+        // The row is bound to a different session than the one binding now:
+        // the pending record is stale and must not pair a long-dead
+        // predecessor with an unrelated claimer.
+        db.rebind_instance_session("luna", "sess-unrelated").unwrap();
+
+        let fabricated: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'luna'
+                   AND data LIKE '%\"action\":\"succession\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fabricated, 0, "stale pending record must not fabricate history");
+        assert_eq!(db.kv_get("nrm053_succession_pending:luna").unwrap(), None);
+        assert_eq!(db.kv_get("nrm053_reservation_owner:luna").unwrap(), None);
+    }
 }

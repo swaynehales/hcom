@@ -563,6 +563,7 @@ impl HcomDb {
         self.clear_session_id_from_other_instances(session_id, new_instance_name)?;
         self.upsert_session_binding(session_id, new_instance_name)?;
         self.maybe_log_pending_succession(new_instance_name, session_id);
+        self.maybe_backfill_succession_claimer(new_instance_name, session_id);
         Ok(())
     }
 
@@ -619,6 +620,7 @@ impl HcomDb {
         )?;
         self.upsert_session_binding(session_id, instance_name)?;
         self.maybe_log_pending_succession(instance_name, session_id);
+        self.maybe_backfill_succession_claimer(instance_name, session_id);
         Ok(())
     }
 
@@ -635,7 +637,8 @@ impl HcomDb {
         let Ok(Some(data)) = self.kv_get(&key) else {
             return;
         };
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
         let displaced_session_id = parsed
             .get("displaced_session_id")
             .and_then(|v| v.as_str())
@@ -644,6 +647,23 @@ impl HcomDb {
             .get("displaced_last_event_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+
+        // F2 guard: a pending record only pairs the predecessor with the
+        // session the pre-registered row is about to take. If the row is
+        // already bound to a different session, the record is stale (a
+        // failed launch, or a later claim took the name) — consume it
+        // without fabricating a succession.
+        if let Ok(Some(row)) = self.get_instance_full(instance_name)
+            && let Some(bound) = row.session_id.as_deref()
+            && !bound.is_empty()
+            && bound != session_id
+        {
+            let _ = self.kv_delete_prefix(&key);
+            let _ =
+                self.kv_delete_prefix(&format!("{RESERVATION_OWNER_KEY}{instance_name}"));
+            return;
+        }
+
         let _ = self.log_life_event(
             instance_name,
             "succession",
@@ -658,6 +678,67 @@ impl HcomDb {
         );
         let _ = self.kv_delete_prefix(&key);
         let _ = self.kv_delete_prefix(&format!("{RESERVATION_OWNER_KEY}{instance_name}"));
+    }
+
+    /// F3 — backfill the claimer of a bare-shell succession.
+    ///
+    /// A claim made with no resolvable session ref logs an honest null
+    /// claimer. The first SessionStart that binds the name afterwards IS the
+    /// claimer, so write a companion event pairing it with the succession —
+    /// never rewrite the original. Fires at most once per succession: the
+    /// backfill event sits above it in the log and the null-claimer scan
+    /// ignores anything it has already answered.
+    pub(crate) fn maybe_backfill_succession_claimer(
+        &self,
+        instance_name: &str,
+        session_id: &str,
+    ) {
+        let Ok((event_id, event_data)) = self.conn.query_row(
+            "SELECT id, data FROM events
+             WHERE type = 'life' AND instance = ?
+               AND data LIKE '%\"action\":\"succession\"%'
+               AND data LIKE '%\"claimer_session_id\":null%'
+             ORDER BY id DESC LIMIT 1",
+            [instance_name],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        ) else {
+            return;
+        };
+
+        let backfilled: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = ? AND id > ?
+                   AND data LIKE '%succession_claimer_backfill%'",
+                params![instance_name, event_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        if backfilled > 0 {
+            return;
+        }
+
+        let displaced_session_id = serde_json::from_str::<serde_json::Value>(&event_data)
+            .ok()
+            .and_then(|v| {
+                v.get("displaced_session_id")
+                    .cloned()
+                    .or(Some(serde_json::Value::Null))
+            })
+            .unwrap_or(serde_json::Value::Null);
+        let _ = self.log_life_event(
+            instance_name,
+            "succession_claimer_backfill",
+            "sessionstart",
+            "first bind after a bare-shell claim",
+            Some(serde_json::json!({
+                "displaced_name": instance_name,
+                "displaced_session_id": displaced_session_id,
+                "claimer_session_id": session_id,
+                "backfills_event_id": event_id,
+            })),
+        );
     }
 
     /// Check if instance has a session binding (hooks active).

@@ -659,6 +659,20 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                     "system",
                     "stale_cleanup",
                 );
+                // F2 — the launch never reached SessionStart; consume its
+                // claim stamps so a foreign --instance-name is not refused
+                // for a dead reservation and no pending succession survives
+                // the row.
+                let _ = db.kv_delete_prefix(&format!(
+                    "{}{}",
+                    crate::db::sessions::SUCCESSION_PENDING_KEY,
+                    data.name
+                ));
+                let _ = db.kv_delete_prefix(&format!(
+                    "{}{}",
+                    crate::db::sessions::RESERVATION_OWNER_KEY,
+                    data.name
+                ));
                 deleted += 1;
             }
         }
@@ -1272,6 +1286,42 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_instances(&db, 3600, 3600);
         assert_eq!(deleted, 1, "a stale row with a dead pid must still be reaped");
         assert!(db.get_instance_full("gone").unwrap().is_none());
+
+        cleanup(path);
+    }
+
+    /// A reaped placeholder consumes the failed launch's claim stamps.
+    #[test]
+    fn test_reaped_placeholder_clears_launch_stamps() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let old_time = now_epoch_f64() - 200.0;
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("stale"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(old_time));
+        db.save_instance_named("stale", &data).unwrap();
+        db.kv_set("nrm053_reservation_owner:stale", Some("owner-launch"))
+            .unwrap();
+        db.kv_set(
+            "nrm053_succession_pending:stale",
+            Some(
+                &serde_json::json!({"displaced_name":"stale","displaced_session_id":"sid-old","displaced_last_event_id":1})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+
+        cleanup_stale_placeholders(&db);
+
+        assert_eq!(
+            db.kv_get("nrm053_succession_pending:stale").unwrap(),
+            None,
+            "a reaped launch must not leave a pending succession behind"
+        );
+        assert_eq!(db.kv_get("nrm053_reservation_owner:stale").unwrap(), None);
 
         cleanup(path);
     }
