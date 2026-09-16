@@ -32,6 +32,7 @@ pub struct InstanceRow {
     pub status_context: String,
     pub status_detail: String,
     pub directory: String,
+    pub launch_directory: String,
     pub created_at: f64,
     pub transcript_path: String,
     pub tool: String,
@@ -85,6 +86,10 @@ impl InstanceRow {
                 .unwrap_or_default(),
             directory: row
                 .get::<_, Option<String>>("directory")?
+                .unwrap_or_default(),
+            launch_directory: row
+                .get::<_, Option<String>>("launch_directory")?
+                .filter(|s| !s.is_empty())
                 .unwrap_or_default(),
             created_at: row.get::<_, Option<f64>>("created_at")?.unwrap_or(0.0),
             transcript_path: row
@@ -394,7 +399,8 @@ impl HcomDb {
         let mut stmt = self.conn.prepare_cached(
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
-                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id
+                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id,
+                    launch_directory
              FROM instances WHERE name = ?",
         )?;
 
@@ -417,6 +423,7 @@ impl HcomDb {
                 "origin_device_id": row.get::<_, String>(14).unwrap_or_default(),
                 "background_log_file": row.get::<_, String>(15).unwrap_or_default(),
                 "last_event_id": row.get::<_, i64>(16).unwrap_or(0),
+                "launch_directory": row.get::<_, String>(17).unwrap_or_default(),
             }))
         }) {
             Ok(snapshot) => Ok(Some(snapshot)),
@@ -906,6 +913,7 @@ impl HcomDb {
             "status_context",
             "status_detail",
             "directory",
+            "launch_directory",
             "created_at",
             "transcript_path",
             "tool",

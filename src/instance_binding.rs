@@ -960,6 +960,10 @@ pub fn initialize_instance_in_position_file(
         Ok(Some(existing)) => {
             let mut updates = serde_json::Map::new();
             updates.insert("directory".into(), serde_json::json!(cwd));
+            // Launch/claim directory (DEC-032 follow-up): recorded once, at
+            // the claim/create moment this function is invoked from — never
+            // by hooks, which keep rewriting `directory`.
+            updates.insert("launch_directory".into(), serde_json::json!(cwd));
 
             if let Some(sid) = session_id {
                 updates.insert("session_id".into(), serde_json::json!(sid));
@@ -1033,6 +1037,7 @@ pub fn initialize_instance_in_position_file(
             data.insert("name".into(), serde_json::json!(instance_name));
             data.insert("last_event_id".into(), serde_json::json!(initial_event_id));
             data.insert("directory".into(), serde_json::json!(cwd));
+            data.insert("launch_directory".into(), serde_json::json!(cwd));
             data.insert("last_stop".into(), serde_json::json!(0));
             data.insert("created_at".into(), serde_json::json!(now));
             data.insert(
@@ -2348,6 +2353,37 @@ mod tests {
         // Default HcomConfig::timeout is 86400 (schema-equivalent default),
         // preserved for anyone who hasn't set HCOM_TIMEOUT.
         assert_eq!(row.wait_timeout, Some(86400));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn initialize_records_launch_directory_once_at_claim_time() {
+        let (db, path) = setup_test_db();
+
+        // Claim/create moment: launch_directory is recorded from the cwd the
+        // name is claimed from.
+        let ok = initialize_instance_in_position_file(
+            &db, "luna", None, None, None, None, None, Some("claude"), false, None, None, None,
+            None, Some("/tmp/nrm053-projA"),
+        );
+        assert!(ok);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.launch_directory, "/tmp/nrm053-projA");
+
+        // Hook updates drift `directory` (init_hook_context rewrites it on
+        // every hook); the launch directory must not follow.
+        db.update_instance_fields(
+            "luna",
+            &serde_json::json!({ "directory": "/tmp/nrm053-projA/nested-repo" })
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.directory, "/tmp/nrm053-projA/nested-repo");
+        assert_eq!(row.launch_directory, "/tmp/nrm053-projA");
 
         cleanup(path);
     }
