@@ -2853,6 +2853,11 @@ static RE_HCOM_PY_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r#"hcom\.py["']?\s+({})\b"#, pattern)).unwrap()
 });
 static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom").unwrap());
+/// Literal launcher-binary hook command: `cmd='/abs/path/to/hcom'; …` — the
+/// path may carry a suffix (test binaries hash their names), so match any
+/// single-quoted path containing an hcom segment.
+static RE_LITERAL_HCOM_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"cmd='[^']*hcom[^']*'"#).unwrap());
 
 /// Resolve the Claude config directory.
 ///
@@ -2884,20 +2889,36 @@ pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
 /// Build a hook command that silently exits 0 when hcom is not installed.
 ///
 /// Claude already executes hook commands through a shell, so this command keeps
-/// all shell logic inline instead of spawning another `sh -c`. It uses the
-/// ${HCOM:-hcom} env var (set in settings.json env block) so it works for both
-/// direct `hcom` and `uvx hcom` invocations. When the binary is absent (e.g.
-/// after `brew uninstall hcom`), the hook exits 0 instead of emitting a "command
-/// not found" error inside the tool.
+/// all shell logic inline instead of spawning another `sh -c`.
+///
+/// The command embeds the CURRENT PROCESS's absolute binary path: a session
+/// launched by one build must run its hooks against that same build, and a
+/// PATH-resolved `hcom` can be a different version entirely (the installed
+/// binary, an older fork). The literal path also survives the launcher's
+/// login-shell env snapshot, which restores the original PATH in the child.
+/// When the path cannot be resolved (or hcom runs under uvx), fall back to
+/// the `${HCOM:-hcom}` env-var form with the `command -v` guard so the hook
+/// still silently exits 0 when hcom is absent.
 fn build_hook_entry_command(cmd_suffix: &str) -> String {
-    // Claude runs hook commands through a POSIX shell on every platform
-    // (Git Bash on Windows), so the same command works everywhere. The
-    // `${HCOM:-hcom}` default plus the `command -v` guard make it silently
-    // exit 0 when hcom isn't on PATH.
-    format!(
-        "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
-        cmd_suffix
-    )
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| {
+            crate::shared::platform::child_process_path(&p).to_string_lossy().replace('\\', "/")
+        })
+        .unwrap_or_default();
+    if !exe.is_empty() && exe.contains('/') {
+        let quoted = format!("'{}'", exe.replace('\'', "'\\''"));
+        format!(
+            "cmd={quoted}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
+            cmd_suffix
+        )
+    } else {
+        format!(
+            "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
+            cmd_suffix
+        )
+    }
 }
 
 /// Format a single Claude permission pattern: `Bash(prefix cmd:*)`.
@@ -3006,6 +3027,10 @@ fn is_hcom_hook_command(command: &str) -> bool {
         return true;
     }
     if RE_SH_HCOM.is_match(command) {
+        return true;
+    }
+    // Literal launcher-binary path: cmd='/abs/path/hcom'
+    if RE_LITERAL_HCOM_PATH.is_match(command) {
         return true;
     }
 
@@ -4290,11 +4315,49 @@ mod tests {
     #[test]
     fn test_build_hook_entry_command_avoids_nested_shell() {
         let command = build_hook_entry_command("poll");
-        assert_eq!(
-            command,
-            "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
+        // The resolved launcher binary is embedded literally; the env-var
+        // form only remains when the path cannot be resolved.
+        assert!(
+            !command.starts_with("sh -c"),
+            "the command must stay inline: {command}"
         );
-        assert!(!command.starts_with("sh -c"));
+        assert!(command.contains("exec $cmd poll || exit 0"), "{command}");
+        assert!(
+            command.starts_with("cmd=") && command.contains("command -v \"${cmd%% *}\""),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn test_build_hook_entry_command_pins_the_launcher_binary() {
+        let command = build_hook_entry_command("sessionstart");
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| {
+                crate::shared::platform::child_process_path(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .unwrap_or_default();
+        if !exe.is_empty() && exe.contains('/') {
+            assert!(
+                command.contains(&format!("cmd='{exe}'")),
+                "the hook must invoke the launcher's own binary, not a PATH lookup: {command}"
+            );
+            assert!(
+                !command.contains("${HCOM:-hcom}"),
+                "the literal form must not fall back to env resolution: {command}"
+            );
+        } else {
+            assert!(command.contains("${HCOM:-hcom}"), "{command}");
+        }
+        // The literal-path shape is recognized as an hcom hook everywhere the
+        // env-var shape is (verify, remove, upgrade detection).
+        assert!(is_hcom_hook_command(&command), "{command}");
+        assert!(is_hcom_hook_command(
+            "cmd='/opt/hcom/bin/hcom'; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd sessionstart || exit 0"
+        ));
     }
 
     #[test]
