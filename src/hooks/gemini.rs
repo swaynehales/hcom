@@ -1344,8 +1344,8 @@ pub enum VerifyFailReason {
         hook_type: String,
         cmd_suffix: String,
     },
-    #[error("hook type '{hook_type}': pinned launcher binary is stale (hooks were written by a different hcom build); re-run setup to re-pin")]
-    HookPinStale { hook_type: String },
+    #[error("hook type '{hook_type}': stored hook command does not match what this build generates (stale pin or old guard shape); re-run setup to rewrite")]
+    HookFormStale { hook_type: String },
     #[error("hook type '{0}': hcom entry has 'type' != \"command\"")]
     HookTypeFieldNotCommand(String),
     #[error("hook type '{hook_type}' name mismatch: expected {expected:?}, got {actual:?}")]
@@ -1651,10 +1651,12 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> Result<(), 
                             cmd_suffix: cmd_suffix.to_string(),
                         });
                     }
-                    // NRM-089 M2: a pin written by a different hcom build is
-                    // stale — report not-installed so setup rewrites it.
-                    if !crate::runtime_env::hook_command_pin_current(command) {
-                        return Err(VerifyFailReason::HookPinStale {
+                    // NRM-089: a stored hcom hook is current only if it is
+                    // byte-equal to the command this build generates for the
+                    // hook — same pin AND same guard shape.
+                    let expected = hook_command(&crate::runtime_env::pinned_hcom_command(), cmd_suffix);
+                    if command != expected {
+                        return Err(VerifyFailReason::HookFormStale {
                             hook_type: hook_type.to_string(),
                         });
                     }
