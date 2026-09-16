@@ -200,6 +200,10 @@ pub struct LaunchParams {
     /// (liveness, tombstone, owner-stamped reservation). Fork/resume pass
     /// their own reservation via `name` and keep the legacy conflict check.
     pub claim_name: bool,
+    /// True when the claimed name came from `--role` (NRM-053 phase 2): the
+    /// succession event's reason names the origin. Carried through
+    /// LaunchClaim, not re-derived.
+    pub claim_via_role: bool,
     pub skip_validation: bool,
     pub terminal: Option<String>,
     pub append_reply_handoff: bool,
@@ -224,6 +228,7 @@ impl Default for LaunchParams {
             batch_id: None,
             name: None,
             claim_name: false,
+            claim_via_role: false,
             skip_validation: false,
             terminal: None,
             append_reply_handoff: true,
@@ -1647,6 +1652,10 @@ pub(crate) struct LaunchClaim {
     pub(crate) displaced_session_id: Option<String>,
     pub(crate) displaced_last_event_id: Option<i64>,
     pub(crate) displaced_tool: Option<String>,
+    /// How the name was supplied (NRM-053 phase 2): `--role` vs
+    /// `--instance-name` — the succession event's reason says which. Carried
+    /// rather than re-derived at stamp time.
+    pub(crate) via_role: bool,
 }
 
 use crate::db::sessions::{RESERVATION_OWNER_KEY, SUCCESSION_PENDING_KEY};
@@ -1663,6 +1672,7 @@ fn claim_explicit_launch_name(
     name: &str,
     owner: &str,
     working_dir: &str,
+    via_role: bool,
 ) -> Result<LaunchClaim> {
     if let Some(row) = db.get_instance_full(name)? {
         let session_empty = row
@@ -1679,7 +1689,10 @@ fn claim_explicit_launch_name(
                 .ok()
                 .flatten();
             if owner_kv.as_deref() == Some(owner) {
-                return Ok(LaunchClaim::default());
+                return Ok(LaunchClaim {
+                    via_role,
+                    ..LaunchClaim::default()
+                });
             }
             bail!(
                 "Instance '{name}' has a pending launch reservation owned by another launch — refusing (a second --instance-name must not promote someone else's reservation)"
@@ -1733,6 +1746,7 @@ fn claim_explicit_launch_name(
             displaced_session_id: row.session_id.clone().filter(|s| !s.is_empty()),
             displaced_last_event_id: Some(row.last_event_id),
             displaced_tool,
+            via_role,
         });
     }
 
@@ -1747,6 +1761,7 @@ fn claim_explicit_launch_name(
             displaced_session_id: Some(meta.session_id).filter(|s| !s.is_empty()),
             displaced_last_event_id: Some(meta.last_event_id),
             displaced_tool,
+            via_role,
         });
     }
 
@@ -1772,13 +1787,18 @@ fn stamp_launch_claim(
         // Record succession event immediately at launch pre-registration time.
         // This guarantees that every harness (claude, opencode, antigravity, codex, gemini)
         // gets its succession recorded in the ledger, even if no session ID ever binds.
+        let reason = if claim.via_role {
+            "name claimed via launch --role"
+        } else {
+            "name claimed via launch --instance-name"
+        };
         db.log_event(
             "life",
             name,
             &serde_json::json!({
                 "action": "succession",
                 "by": "launch",
-                "reason": "name claimed via launch --instance-name",
+                "reason": reason,
                 "from_tool": claim.displaced_tool,
                 "to_tool": target_tool,
                 "displaced_name": name,
@@ -2223,6 +2243,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 name,
                 &process_id,
                 working_dir,
+                params.claim_via_role,
             )?;
         }
 
@@ -4229,7 +4250,7 @@ mod tests {
     fn launch_claim_refuses_live_row() {
         let db = launcher_test_db();
         insert_claim_row(&db, "luna", Some("sid-live"), false);
-        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim")
+        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim", false)
             .unwrap_err();
         assert!(err.to_string().contains("is live"), "{err}");
         assert!(db.get_instance_full("luna").unwrap().is_some());
@@ -4240,7 +4261,7 @@ mod tests {
     fn launch_claim_tombstones_dead_row_with_displaced_fields() {
         let db = launcher_test_db();
         insert_claim_row(&db, "luna", Some("sid-dead"), true);
-        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim")
+        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim", false)
             .unwrap();
         assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-dead"));
         assert_eq!(claim.displaced_last_event_id, Some(33));
@@ -4269,12 +4290,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/other")
+        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/other", false)
             .unwrap_err();
         assert!(err.to_string().contains("Refusing to reclaim"), "{err}");
 
         // The tombstone was written by claude; the claiming tool is not compared.
-        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim")
+        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim", false)
             .unwrap();
         assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-tomb"));
         assert_eq!(claim.displaced_last_event_id, Some(21));
@@ -4295,7 +4316,7 @@ mod tests {
             .unwrap();
 
         let err =
-            claim_explicit_launch_name(&db, "luna", "owner-mine", "/tmp/claim")
+            claim_explicit_launch_name(&db, "luna", "owner-mine", "/tmp/claim", false)
                 .unwrap_err();
         assert!(
             err.to_string().contains("owned by another launch"),
@@ -4304,7 +4325,7 @@ mod tests {
         assert!(db.get_instance_full("luna").unwrap().is_some());
 
         let own =
-            claim_explicit_launch_name(&db, "luna", "owner-other", "/tmp/claim")
+            claim_explicit_launch_name(&db, "luna", "owner-other", "/tmp/claim", false)
                 .unwrap();
         assert_eq!(own, LaunchClaim::default(), "the owning launch passes through");
     }
@@ -4329,6 +4350,7 @@ mod tests {
             "luna",
             "owner-1",
             &claim_dir.to_string_lossy(),
+            false,
         )
     }
 
@@ -4507,12 +4529,82 @@ mod tests {
     }
 
     #[test]
+    fn stamp_launch_claim_reason_says_role_origin() {
+        let db = launcher_test_db();
+        let claim = LaunchClaim {
+            displaced_session_id: Some("sid-old".to_string()),
+            displaced_last_event_id: Some(42),
+            displaced_tool: Some("opencode".to_string()),
+            via_role: true,
+        };
+        stamp_launch_claim(&db, "nova", "owner-1", &claim, "claude").unwrap();
+        let ev: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"succession\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ev.contains("\"reason\":\"name claimed via launch --role\""),
+            "{ev}"
+        );
+
+        // The --instance-name origin keeps its reason.
+        let db2 = launcher_test_db();
+        let claim = LaunchClaim {
+            displaced_session_id: Some("sid-old".to_string()),
+            displaced_last_event_id: Some(42),
+            displaced_tool: Some("opencode".to_string()),
+            via_role: false,
+        };
+        stamp_launch_claim(&db2, "nova", "owner-1", &claim, "claude").unwrap();
+        let ev: String = db2
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"succession\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ev.contains("\"reason\":\"name claimed via launch --instance-name\""),
+            "{ev}"
+        );
+    }
+
+    #[test]
+    fn trailing_role_and_instance_name_error_in_strict_parse() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let err = crate::commands::launch::extract_launch_flags(&s(&["--role"]), true).unwrap_err();
+        assert!(err.to_string().contains("--role requires a value"), "{err}");
+        let err = crate::commands::launch::extract_launch_flags(&s(&["--instance-name"]), true).unwrap_err();
+        assert!(
+            err.to_string().contains("--instance-name requires a value"),
+            "{err}"
+        );
+        // Non-strict (resume) keeps the legacy pass-through.
+        let (flags, tool_args) =
+            crate::commands::launch::extract_launch_flags(&s(&["--role"]), false).unwrap();
+        assert!(flags.role.is_none() && flags.instance_name.is_none());
+        assert_eq!(tool_args, vec!["--role".to_string()]);
+    }
+
+    #[test]
     fn stamp_launch_claim_logs_succession_event_with_from_and_to_tool() {
         let db = launcher_test_db();
         let claim = LaunchClaim {
             displaced_session_id: Some("sid-old".to_string()),
             displaced_last_event_id: Some(42),
             displaced_tool: Some("opencode".to_string()),
+            via_role: false,
         };
         stamp_launch_claim(&db, "luna", "owner-1", &claim, "antigravity").unwrap();
 
@@ -4552,6 +4644,7 @@ mod tests {
             displaced_session_id: Some("sid-old".to_string()),
             displaced_last_event_id: Some(42),
             displaced_tool: Some("opencode".to_string()),
+            via_role: false,
         };
         stamp_launch_claim(&db, "luna", "owner-luna", &claim, "antigravity").unwrap();
 
@@ -4581,6 +4674,7 @@ mod tests {
             displaced_session_id: Some("sid-oc-old".to_string()),
             displaced_last_event_id: Some(42),
             displaced_tool: Some("opencode".to_string()),
+            via_role: false,
         };
 
         // 2. Launch claims name as claude: succession logged immediately with claimer_session_id: null
