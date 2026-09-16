@@ -708,6 +708,45 @@ fn start_rebind_opts(
         return Ok(1);
     }
 
+    // GAP 1 — the ordinary succession is a logged transfer: a claim over a
+    // stopped-or-tombstoned name records the label moving between session
+    // refs, with the same displaced/claimer fields --force logs. A consented
+    // succession and a forced live takeover must stay distinguishable, so
+    // this is action "succession", never "force_claim".
+    let displaced_session = if own_session || target_remote {
+        None
+    } else if let Some(ref row) = target_data {
+        row.session_id.clone().filter(|s| !s.is_empty())
+    } else {
+        target_meta
+            .as_ref()
+            .map(|m| m.session_id.clone())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(displaced_sid) = displaced_session {
+        let _ = db.log_event(
+            "life",
+            &target_name,
+            &json!({
+                "action": "succession",
+                "by": "start --as",
+                "reason": "label transferred to a new session ref",
+                "displaced_name": target_name,
+                "displaced_session_id": displaced_sid,
+                "claimer_session_id": session_id,
+                "last_event_id": last_event_id,
+            }),
+        );
+        log_info(
+            "start",
+            "claim.succession",
+            &format!(
+                "instance={} displaced_session={displaced_sid} claimer_session={:?}",
+                target_name, session_id
+            ),
+        );
+    }
+
     // Post-claim bookkeeping outside the transaction: Claude actor state and
     // the validated-session cache are keyed by session id and are recovered by
     // a later hook if they fail here.
@@ -794,6 +833,7 @@ struct RebindTargetMetadata {
     tool: String,
     directory: String,
     last_event_id: i64,
+    session_id: String,
 }
 
 fn ensure_rebind_compatible(
@@ -837,6 +877,7 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
             tool: inst.tool,
             directory: inst.directory,
             last_event_id: inst.last_event_id,
+            session_id: inst.session_id.unwrap_or_default(),
         });
     }
 
@@ -869,6 +910,11 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
                     .get("last_event_id")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0),
+                session_id: snapshot
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             });
         }
     }
@@ -1406,6 +1452,142 @@ mod tests {
         assert_eq!(args.as_name.as_deref(), Some("luna"));
         assert!(args.force);
         assert!(args.adopt_unknown);
+    }
+
+    #[test]
+    #[serial]
+    fn test_succession_event_logged_on_tombstone_reclaim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-gap1";
+        std::fs::create_dir_all(cwd).unwrap();
+
+        log_stopped_snapshot(&db, "nova", "claude", cwd, "sid-old", 77);
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions::default()).unwrap();
+        assert_eq!(result, 0);
+
+        let events: Vec<String> = {
+            let mut stmt = db
+                .conn()
+                .prepare(
+                    "SELECT data FROM events WHERE type = 'life' AND instance = 'nova' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let succession = events
+            .iter()
+            .filter(|d| d.contains("\"action\":\"succession\""))
+            .count();
+        assert_eq!(
+            succession, 1,
+            "the ordinary succession must be logged as exactly one transfer event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|d| d.contains("force_claim")),
+            "a consented succession must never be logged as force_claim"
+        );
+        let ev = events
+            .iter()
+            .find(|d| d.contains("\"action\":\"succession\""))
+            .unwrap();
+        assert!(
+            ev.contains("\"displaced_session_id\":\"sid-old\""),
+            "the transfer must name the predecessor session ref: {ev}"
+        );
+        assert!(
+            ev.contains("\"claimer_session_id\":\"sess-claim\""),
+            "the transfer must name the claimer session ref: {ev}"
+        );
+        assert!(
+            ev.contains("\"displaced_name\":\"nova\""),
+            "the transfer must name the label: {ev}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_succession_event_logged_on_dead_row_reclaim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-gap1b";
+        std::fs::create_dir_all(cwd).unwrap();
+        insert_claim_target(
+            &db,
+            "nova",
+            None,
+            crate::shared::time::now_epoch_i64() - 1000,
+            cwd,
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'sid-dead' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions::default()).unwrap();
+        assert_eq!(result, 0);
+
+        let ev: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = 'nova'
+                   AND data LIKE '%\"action\":\"succession\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ev.contains("\"displaced_session_id\":\"sid-dead\""), "{ev}");
+        assert!(ev.contains("\"claimer_session_id\":\"sess-claim\""), "{ev}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_succession_event_for_own_session_or_adopted_name() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-gap1c";
+        std::fs::create_dir_all(cwd).unwrap();
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        // adopted fresh name: no predecessor, no transfer
+        start_rebind_opts(
+            &db,
+            "brandnew",
+            &ctx,
+            None,
+            ClaimOptions { adopt_unknown: true, force: false },
+        )
+        .unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'brandnew'
+                   AND data LIKE '%\"action\":\"succession\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "adopting a never-used name is not a succession");
     }
 
     #[test]
