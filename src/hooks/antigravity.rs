@@ -89,11 +89,12 @@ fn antigravity_hooks_path(gemini_dir: &Path) -> PathBuf {
 ///
 fn hook_sh_cmd(hcom_cmd: &str, subcmd: &str, fallback_json: &str) -> String {
     let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-    // NRM-089 M1: a literal pin (absolute path, no spaces — the only form
+    // NRM-089 M1: a literal pin (absolute path — the only form
     // pinned_hcom_command produces) gets the three-way guard shared with the
     // claude and gemini builders, keeping the base64 fallback JSON as the
-    // last resort; prefix forms keep the legacy shape.
-    if hcom_cmd.contains('/') && !hcom_cmd.contains(' ') {
+    // last resort; the guard execs "$cmd" quoted, so paths with spaces are
+    // safe; prefix forms keep the legacy shape.
+    if hcom_cmd.contains('/') {
         let script = crate::runtime_env::pinned_hook_script(
             hcom_cmd,
             subcmd,
