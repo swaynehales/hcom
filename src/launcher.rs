@@ -1661,7 +1661,6 @@ fn claim_explicit_launch_name(
     db: &HcomDb,
     name: &str,
     owner: &str,
-    tool: &str,
     working_dir: &str,
 ) -> Result<LaunchClaim> {
     if let Some(row) = db.get_instance_full(name)? {
@@ -1719,7 +1718,7 @@ fn claim_explicit_launch_name(
     }
 
     if let Ok(meta) = crate::commands::start::load_rebind_target_metadata(db, name) {
-        crate::commands::start::ensure_rebind_compatible(name, &meta, tool, working_dir)?;
+        crate::commands::start::ensure_rebind_compatible(name, &meta, working_dir)?;
         return Ok(LaunchClaim {
             displaced_session_id: Some(meta.session_id).filter(|s| !s.is_empty()),
             displaced_last_event_id: Some(meta.last_event_id),
@@ -2179,7 +2178,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 db,
                 name,
                 &process_id,
-                normalized.as_str(),
                 working_dir,
             )?;
         }
@@ -4177,7 +4175,7 @@ mod tests {
     fn launch_claim_refuses_live_row() {
         let db = launcher_test_db();
         insert_claim_row(&db, "luna", Some("sid-live"), false);
-        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "claude", "/tmp/claim")
+        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim")
             .unwrap_err();
         assert!(err.to_string().contains("is live"), "{err}");
         assert!(db.get_instance_full("luna").unwrap().is_some());
@@ -4188,7 +4186,7 @@ mod tests {
     fn launch_claim_tombstones_dead_row_with_displaced_fields() {
         let db = launcher_test_db();
         insert_claim_row(&db, "luna", Some("sid-dead"), true);
-        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "claude", "/tmp/claim")
+        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim")
             .unwrap();
         assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-dead"));
         assert_eq!(claim.displaced_last_event_id, Some(33));
@@ -4217,11 +4215,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "codex", "/tmp/claim")
+        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/other")
             .unwrap_err();
         assert!(err.to_string().contains("Refusing to reclaim"), "{err}");
 
-        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "claude", "/tmp/claim")
+        // The tombstone was written by claude; the claiming tool is not compared.
+        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "/tmp/claim")
             .unwrap();
         assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-tomb"));
         assert_eq!(claim.displaced_last_event_id, Some(21));
@@ -4242,7 +4241,7 @@ mod tests {
             .unwrap();
 
         let err =
-            claim_explicit_launch_name(&db, "luna", "owner-mine", "claude", "/tmp/claim")
+            claim_explicit_launch_name(&db, "luna", "owner-mine", "/tmp/claim")
                 .unwrap_err();
         assert!(
             err.to_string().contains("owned by another launch"),
@@ -4251,7 +4250,7 @@ mod tests {
         assert!(db.get_instance_full("luna").unwrap().is_some());
 
         let own =
-            claim_explicit_launch_name(&db, "luna", "owner-other", "claude", "/tmp/claim")
+            claim_explicit_launch_name(&db, "luna", "owner-other", "/tmp/claim")
                 .unwrap();
         assert_eq!(own, LaunchClaim::default(), "the owning launch passes through");
     }
