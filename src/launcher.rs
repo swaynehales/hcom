@@ -1576,8 +1576,15 @@ fn claim_explicit_launch_name(
             .unwrap_or(serde_json::Value::Null);
         // DEC-032 follow-up: the dead-row path used to take the name from any
         // directory. The same project check as the tombstone path applies,
-        // keyed on the row's directory.
-        crate::commands::start::ensure_same_project(name, &row.directory, working_dir)?;
+        // keyed on the row's LAUNCH directory (operator ruling 2026-09-16) —
+        // instances.directory drifts with the harness cwd, so it is only the
+        // fallback for legacy rows.
+        let stored = if row.launch_directory.is_empty() {
+            &row.directory
+        } else {
+            &row.launch_directory
+        };
+        crate::commands::start::ensure_same_project(name, stored, working_dir)?;
         let displaced_tool = snapshot
             .get("tool")
             .and_then(|v| v.as_str())
