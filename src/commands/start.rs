@@ -764,14 +764,20 @@ fn start_rebind_opts(
     // on it are stale the moment this claim wins. Clearing them here keeps a
     // failed launch's pending record from firing a fabricated succession at
     // this claimer's SessionStart.
-    let _ = db.kv_delete_prefix(&format!(
-        "{}{target_name}",
-        crate::db::sessions::SUCCESSION_PENDING_KEY
-    ));
-    let _ = db.kv_delete_prefix(&format!(
-        "{}{target_name}",
-        crate::db::sessions::RESERVATION_OWNER_KEY
-    ));
+    let _ = db.kv_set(
+        &format!(
+            "{}{target_name}",
+            crate::db::sessions::SUCCESSION_PENDING_KEY
+        ),
+        None,
+    );
+    let _ = db.kv_set(
+        &format!(
+            "{}{target_name}",
+            crate::db::sessions::RESERVATION_OWNER_KEY
+        ),
+        None,
+    );
 
     // Post-claim bookkeeping outside the transaction: Claude actor state and
     // the validated-session cache are keyed by session id and are recovered by
@@ -1564,6 +1570,43 @@ mod tests {
             ev.contains("\"displaced_name\":\"nova\""),
             "the transfer must name the label: {ev}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_preserves_sibling_pending_and_owner_keys() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-gap1-sibling";
+        std::fs::create_dir_all(cwd).unwrap();
+
+        // Plant sibling keys that share the prefix "nova"
+        db.kv_set("nrm053_succession_pending:nova_x", Some("pending-sibling"))
+            .unwrap();
+        db.kv_set("nrm053_reservation_owner:nova_x", Some("owner-sibling"))
+            .unwrap();
+
+        log_stopped_snapshot(&db, "nova", "claude", cwd, "sid-old", 77);
+
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-claim")),
+            cwd,
+        );
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions::default()).unwrap();
+        assert_eq!(result, 0);
+
+        // Exact-key delete: sibling keys must survive
+        assert_eq!(
+            db.kv_get("nrm053_succession_pending:nova_x").unwrap().as_deref(),
+            Some("pending-sibling"),
+            "sibling pending record must not be wiped by claiming nova"
+        );
+        assert_eq!(
+            db.kv_get("nrm053_reservation_owner:nova_x").unwrap().as_deref(),
+            Some("owner-sibling"),
+            "sibling reservation owner must not be wiped by claiming nova"
+        );
+        assert_eq!(db.kv_get("nrm053_succession_pending:nova").unwrap(), None);
     }
 
     #[test]
