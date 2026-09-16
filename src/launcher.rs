@@ -196,6 +196,10 @@ pub struct LaunchParams {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub name: Option<String>,
+    /// True when `name` came from `--instance-name`: the D4 claim path runs
+    /// (liveness, tombstone, owner-stamped reservation). Fork/resume pass
+    /// their own reservation via `name` and keep the legacy conflict check.
+    pub claim_name: bool,
     pub skip_validation: bool,
     pub terminal: Option<String>,
     pub append_reply_handoff: bool,
@@ -219,6 +223,7 @@ impl Default for LaunchParams {
             run_here: None,
             batch_id: None,
             name: None,
+            claim_name: false,
             skip_validation: false,
             terminal: None,
             append_reply_handoff: true,
@@ -1508,6 +1513,116 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
     );
 }
 
+/// Result of the D4 launch claim: what the predecessor left behind, for the
+/// promotion-time succession event and the D9 cursor rule (keep the
+/// predecessor's cursor).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LaunchClaim {
+    pub(crate) displaced_session_id: Option<String>,
+    pub(crate) displaced_last_event_id: Option<i64>,
+}
+
+use crate::db::sessions::{RESERVATION_OWNER_KEY, SUCCESSION_PENDING_KEY};
+
+/// D4 claim for `--instance-name`: same properties as the `start --as` claim,
+/// at launch time. Live rows (computed status + alive-pid backstop) refuse; a
+/// pending reservation owned by ANOTHER launch counts live and refuses; a
+/// dead row is tombstoned via finalize_instance_stop (never raw delete); a
+/// tombstoned target runs the tool/cwd compatibility check. The row itself is
+/// created by the pre-register step; binding happens at SessionStart, where
+/// the pending-succession record is promoted into the succession event.
+fn claim_explicit_launch_name(
+    db: &HcomDb,
+    name: &str,
+    owner: &str,
+    tool: &str,
+    working_dir: &str,
+) -> Result<LaunchClaim> {
+    if let Some(row) = db.get_instance_full(name)? {
+        let session_empty = row
+            .session_id
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if row.status == crate::instance_names::PLACEHOLDER_STATUS
+            && row.status_context == crate::instance_names::PLACEHOLDER_CONTEXT
+            && session_empty
+        {
+            let owner_kv = db
+                .kv_get(&format!("{RESERVATION_OWNER_KEY}{name}"))
+                .ok()
+                .flatten();
+            if owner_kv.as_deref() == Some(owner) {
+                return Ok(LaunchClaim::default());
+            }
+            bail!(
+                "Instance '{name}' has a pending launch reservation owned by another launch — refusing (a second --instance-name must not promote someone else's reservation)"
+            );
+        }
+        if crate::commands::start::row_is_remote(&row) {
+            bail!(
+                "Instance '{name}' is a remote identity — refusing to claim it locally"
+            );
+        }
+        if crate::commands::start::claim_target_is_live(db, &row) {
+            bail!(
+                "Instance '{name}' is live. Refusing to claim a running identity — stop it first, or use a different name"
+            );
+        }
+        let snapshot = db
+            .get_instance_snapshot(name)
+            .ok()
+            .flatten()
+            .unwrap_or(serde_json::Value::Null);
+        db.finalize_instance_stop(
+            name,
+            row.created_at,
+            row.session_id.as_deref(),
+            row.agent_id.as_deref(),
+            &serde_json::json!({
+                "action": "stopped",
+                "by": "launch --instance-name",
+                "reason": "succession-claimed",
+                "snapshot": snapshot,
+            }),
+        )?;
+        return Ok(LaunchClaim {
+            displaced_session_id: row.session_id.clone().filter(|s| !s.is_empty()),
+            displaced_last_event_id: Some(row.last_event_id),
+        });
+    }
+
+    if let Ok(meta) = crate::commands::start::load_rebind_target_metadata(db, name) {
+        crate::commands::start::ensure_rebind_compatible(name, &meta, tool, working_dir)?;
+        return Ok(LaunchClaim {
+            displaced_session_id: Some(meta.session_id).filter(|s| !s.is_empty()),
+            displaced_last_event_id: Some(meta.last_event_id),
+        });
+    }
+
+    Ok(LaunchClaim::default())
+}
+
+/// Stamp the owner and the pending-succession record for a claimed name, and
+/// hand the displaced cursor back for the pre-registered row.
+fn stamp_launch_claim(db: &HcomDb, name: &str, owner: &str, claim: &LaunchClaim) -> Result<()> {
+    db.kv_set(&format!("{RESERVATION_OWNER_KEY}{name}"), Some(owner))?;
+    if claim.displaced_session_id.is_some() || claim.displaced_last_event_id.is_some() {
+        db.kv_set(
+            &format!("{SUCCESSION_PENDING_KEY}{name}"),
+            Some(
+                &serde_json::json!({
+                    "displaced_name": name,
+                    "displaced_session_id": claim.displaced_session_id,
+                    "displaced_last_event_id": claim.displaced_last_event_id,
+                })
+                .to_string(),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 /// Inject ephemeral workspace trust flags into args for gemini and codex.
 ///
 /// - gemini: adds `--skip-trust` (session-scoped, no persisted state)
@@ -1776,7 +1891,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
         crate::identity::validate_claim_name(db, name)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        resolve_explicit_name_conflict(db, name)?;
+        if !params.claim_name {
+            resolve_explicit_name_conflict(db, name)?;
+        }
     }
 
     // System prompt file for Gemini/Codex
@@ -1922,6 +2039,22 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             instance_env.insert("HCOM_IS_FORK".to_string(), "1".to_string());
         }
 
+        // D4 claim path for --instance-name: liveness, tombstone, owner-stamped
+        // reservation. Runs here (process_id already minted) so the
+        // reservation owner is the launch id.
+        let mut launch_claim = LaunchClaim::default();
+        if params.claim_name
+            && let Some(ref name) = params.name
+        {
+            launch_claim = claim_explicit_launch_name(
+                db,
+                name,
+                &process_id,
+                normalized.as_str(),
+                working_dir,
+            )?;
+        }
+
         let instance_name = if let Some(ref name) = params.name {
             name.clone()
         } else {
@@ -1970,6 +2103,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         // Pre-register instance
         if let Err(e) = (|| -> Result<()> {
+            if params.claim_name {
+                stamp_launch_claim(db, &instance_name, &process_id, &launch_claim)?;
+            }
             instance_binding::initialize_instance_in_position_file(
                 db,
                 &instance_name,
@@ -1991,6 +2127,22 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
             );
             db.set_process_binding(&process_id, "", &instance_name)?;
+            if params.claim_name
+                && let Some(cursor) = launch_claim.displaced_last_event_id
+                && cursor > 0
+                && let Err(e) = db.update_instance_fields(
+                    &instance_name,
+                    &serde_json::json!({ "last_event_id": cursor })
+                        .as_object()
+                        .unwrap(),
+                )
+            {
+                crate::log::log_warn(
+                    "launch",
+                    "claim_cursor_fail",
+                    &format!("instance={instance_name} err={e}"),
+                );
+            }
             Ok(())
         })() {
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
@@ -3775,5 +3927,184 @@ mod tests {
         assert!(win.contains_key("MY_SECRET") && !win.contains_key("HCOM_X"));
         let unix = sidecar_ambient_env(&env, strip.iter().copied(), false);
         assert!(!unix.contains_key("NO_COLOR") && unix.contains_key("no_color")); // Unix exact-case preserved
+    }
+
+    fn insert_claim_row(db: &crate::db::HcomDb, name: &str, session_id: Option<&str>, stale: bool) {
+        let now = chrono::Utc::now().timestamp() as i64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at,
+                  last_seen, directory, pid, background, last_event_id)
+                 VALUES (?1, ?2, 'claude', 'active', 'running', ?3, ?4, 0, '/tmp/claim', NULL, 0, 33)",
+                rusqlite::params![
+                    name,
+                    session_id,
+                    if stale { now - 100_000 } else { now },
+                    (now - 5) as f64,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn stopped_events(db: &crate::db::HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = ? AND data LIKE '%\"action\":\"stopped\"%'",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn launch_claim_refuses_live_row() {
+        let db = launcher_test_db();
+        insert_claim_row(&db, "luna", Some("sid-live"), false);
+        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "claude", "/tmp/claim")
+            .unwrap_err();
+        assert!(err.to_string().contains("is live"), "{err}");
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+        assert_eq!(stopped_events(&db, "luna"), 0);
+    }
+
+    #[test]
+    fn launch_claim_tombstones_dead_row_with_displaced_fields() {
+        let db = launcher_test_db();
+        insert_claim_row(&db, "luna", Some("sid-dead"), true);
+        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "claude", "/tmp/claim")
+            .unwrap();
+        assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-dead"));
+        assert_eq!(claim.displaced_last_event_id, Some(33));
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "the dead predecessor row must be gone"
+        );
+        assert_eq!(stopped_events(&db, "luna"), 1);
+    }
+
+    #[test]
+    fn launch_claim_tombstone_only_checks_compat_and_returns_fields() {
+        let db = launcher_test_db();
+        db.log_event(
+            "life",
+            "luna",
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "claude",
+                    "directory": "/tmp/claim",
+                    "session_id": "sid-tomb",
+                    "last_event_id": 21
+                }
+            }),
+        )
+        .unwrap();
+
+        let err = claim_explicit_launch_name(&db, "luna", "owner-1", "codex", "/tmp/claim")
+            .unwrap_err();
+        assert!(err.to_string().contains("Refusing to reclaim"), "{err}");
+
+        let claim = claim_explicit_launch_name(&db, "luna", "owner-1", "claude", "/tmp/claim")
+            .unwrap();
+        assert_eq!(claim.displaced_session_id.as_deref(), Some("sid-tomb"));
+        assert_eq!(claim.displaced_last_event_id, Some(21));
+    }
+
+    #[test]
+    fn foreign_launch_reservation_counts_live() {
+        let db = launcher_test_db();
+        let now = chrono::Utc::now().timestamp() as i64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool)
+                 VALUES ('luna', 'pending', 'new', ?1, 'claude')",
+                [now],
+            )
+            .unwrap();
+        db.kv_set("nrm053_reservation_owner:luna", Some("owner-other"))
+            .unwrap();
+
+        let err =
+            claim_explicit_launch_name(&db, "luna", "owner-mine", "claude", "/tmp/claim")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("owned by another launch"),
+            "a second --instance-name must not promote a foreign reservation: {err}"
+        );
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+
+        let own =
+            claim_explicit_launch_name(&db, "luna", "owner-other", "claude", "/tmp/claim")
+                .unwrap();
+        assert_eq!(own, LaunchClaim::default(), "the owning launch passes through");
+    }
+
+    #[test]
+    fn promotion_writes_succession_event_and_clears_stamps() {
+        let db = launcher_test_db();
+        db.kv_set(
+            "nrm053_succession_pending:luna",
+            Some(
+                &serde_json::json!({
+                    "displaced_name": "luna",
+                    "displaced_session_id": "sid-tomb",
+                    "displaced_last_event_id": 21
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        db.kv_set("nrm053_reservation_owner:luna", Some("owner-1"))
+            .unwrap();
+        insert_claim_row(&db, "luna", None, true);
+
+        db.rebind_instance_session("luna", "sess-promoter").unwrap();
+
+        let ev: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = 'luna'
+                   AND data LIKE '%\"action\":\"succession\"%'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ev.contains("\"displaced_session_id\":\"sid-tomb\""), "{ev}");
+        assert!(ev.contains("\"claimer_session_id\":\"sess-promoter\""), "{ev}");
+        assert!(ev.contains("\"displaced_name\":\"luna\""), "{ev}");
+        assert_eq!(
+            db.kv_get("nrm053_succession_pending:luna").unwrap(),
+            None,
+            "the pending record must be consumed by the promotion"
+        );
+        assert_eq!(db.kv_get("nrm053_reservation_owner:luna").unwrap(), None);
+
+        // A plain rebind with no pending record writes nothing.
+        let before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'luna'
+                   AND data LIKE '%\"action\":\"succession\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.rebind_instance_session("luna", "sess-again").unwrap();
+        let after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'luna'
+                   AND data LIKE '%\"action\":\"succession\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
     }
 }

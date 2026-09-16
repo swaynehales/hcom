@@ -791,6 +791,7 @@ fn handle_remote_launch(
             run_here: Some(false),
             batch_id: None,
             name: None,
+            claim_name: false,
             skip_validation: false,
             terminal: request.terminal,
             append_reply_handoff: false,
