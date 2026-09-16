@@ -568,6 +568,7 @@ fn prepare_resume_plan_from_source(
             launcher_name: launcher_name_for_output,
         },
         launch: LaunchParams {
+            claim_via_role: false,
             tool: tool.clone(),
             count: 1,
             args: merged_args,
@@ -799,7 +800,13 @@ fn extract_resume_flags(
             i += 1;
         }
     }
-    let (flags, remaining) = extract_launch_flags(&filtered);
+    // Non-strict: a trailing --role/--instance-name in resume extras keeps
+    // the legacy pass-through to the tool args (resume never claims via
+    // these flags). Non-strict never returns Err — both bails are
+    // strict-gated — so the fallback is unreachable.
+    let (flags, remaining) = extract_launch_flags(&filtered, false).unwrap_or_else(|_| {
+        (crate::commands::launch::HcomLaunchFlags::default(), Vec::new())
+    });
     (dir, flags, remaining)
 }
 

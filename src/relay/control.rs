@@ -774,6 +774,7 @@ fn handle_remote_launch(
     let result = launcher::launch(
         db,
         LaunchParams {
+            claim_via_role: false,
             tool: request.tool.clone(),
             count: request.count,
             args: prepared.args,

@@ -205,6 +205,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                 None
             },
             claim_name: hcom_flags.instance_name.is_some(),
+            claim_via_role: hcom_flags.role.is_some(),
             skip_validation: false,
             terminal,
             append_reply_handoff: true,
@@ -496,7 +497,6 @@ fn resolve_launch_role(
     let valid = crate::identity::validate_claim_name(&db, &derived)
         .map_err(|e| anyhow::anyhow!("--role '{role}': {e}"))?;
     hcom_flags.instance_name = Some(valid);
-    hcom_flags.role = None;
     Ok(hcom_flags)
 }
 
@@ -546,7 +546,7 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
     let tool = argv[idx].to_string();
     idx += 1;
 
-    let (flags, tool_args) = extract_launch_flags(&argv[idx..]);
+    let (flags, tool_args) = extract_launch_flags(&argv[idx..], true)?;
 
     Ok((count, tool, flags, tool_args))
 }
@@ -630,7 +630,10 @@ pub(crate) fn load_hcom_config() -> HcomConfig {
     })
 }
 
-pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<String>) {
+pub(crate) fn extract_launch_flags(
+    args: &[String],
+    strict: bool,
+) -> Result<(HcomLaunchFlags, Vec<String>)> {
     let mut flags = HcomLaunchFlags::default();
     let mut tool_args = Vec::new();
     let mut i = 0;
@@ -671,12 +674,31 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             continue;
         }
         match args[i].as_str() {
-            "--instance-name" if i + 1 < args.len() => {
-                flags.instance_name = Some(args[i + 1].clone());
+            // NRM-053: a trailing flag with no value must error, not fall
+            // through to the tool's own args while hcom launches a random
+            // name.
+            "--instance-name" => {
+                let Some(v) = args.get(i + 1).filter(|_| strict || i + 1 < args.len()) else {
+                    if strict {
+                        bail!("--instance-name requires a value");
+                    }
+                    tool_args.push(args[i].clone());
+                    i += 1;
+                    continue;
+                };
+                flags.instance_name = Some(v.clone());
                 i += 2;
             }
-            "--role" if i + 1 < args.len() => {
-                flags.role = Some(args[i + 1].clone());
+            "--role" => {
+                let Some(v) = args.get(i + 1).filter(|_| strict || i + 1 < args.len()) else {
+                    if strict {
+                        bail!("--role requires a value");
+                    }
+                    tool_args.push(args[i].clone());
+                    i += 1;
+                    continue;
+                };
+                flags.role = Some(v.clone());
                 i += 2;
             }
             "--tag" if i + 1 < args.len() => {
@@ -743,7 +765,7 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
         }
     }
 
-    (flags, tool_args)
+    Ok((flags, tool_args))
 }
 
 pub(crate) struct LaunchOutputContext<'a> {
