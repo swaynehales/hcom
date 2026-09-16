@@ -122,36 +122,68 @@ pub(crate) fn pinned_hook_script(
 }
 
 /// Does an installed hook command still carry the CURRENT binary's pin?
-/// (NRM-089 review M2.) A literal pin pointing anywhere else, or a
-/// prefix/env form while the current binary can pin, is stale and the hooks
-/// must be rewritten. When the current binary cannot pin (uvx), the
-/// prefix/env forms are the current shape and count as installed.
-///
-/// The stored command carries the pin shell-escaped (apostrophes become
-/// `'\''`, plus one more layer inside gemini/antigravity's `sh -c`), so the
-/// match runs on both strings with quote/backslash characters removed —
-/// the same escaping the builders apply, inverted rather than re-copied.
+/// (NRM-089 review M2.) The stored command is parsed for the builder's own
+/// guard shape (`cmd='<escaped pin>';`), the escaping is reversed layer by
+/// layer — the `sh -c` wrapper for gemini/antigravity, then the builder's
+/// single-quote layer — and the extracted pin is compared to the current
+/// canonical exe by EXACT string equality. No extracted pin (legacy or
+/// prefix forms) is stale when the current binary can pin; a pin that
+/// cannot pin (uvx) keeps the prefix/env forms current.
 pub(crate) fn hook_command_pin_current(command: &str) -> bool {
+    let extracted = extract_pinned_command_path(command);
     match pinned_hcom_binary() {
-        Some(exe) => command_contains_pin(command, &exe),
-        None => !has_stale_literal_pin(command),
+        Some(exe) => extracted.as_deref() == Some(exe.as_str()),
+        None => extracted.is_none(),
     }
 }
 
-/// True when `command` embeds `pin`, directly or under any single-quote /
-/// backslash escaping the shell builders may have layered on it.
-pub(crate) fn command_contains_pin(command: &str, pin: &str) -> bool {
-    if command.contains(pin) {
-        return true;
-    }
-    let stripped = |s: &str| s.chars().filter(|c| *c != '\'' && *c != '\\').collect::<String>();
-    stripped(command).contains(&stripped(pin))
+/// Reverse one application of [`sh_single_quote`]: a stored body whose
+/// apostrophes appear as the 4-char sequence `'\''`.
+fn sh_unquote_layer(s: &str) -> String {
+    s.replace("'\\''", "'")
 }
 
-/// A literal-pinned hook command whose pin is not the current binary.
-fn has_stale_literal_pin(command: &str) -> bool {
-    command.contains("cmd=") && !command.contains("${HCOM")
+/// Extract the literal launcher pin from a stored hook command, undoing the
+/// builders' escaping. `None` when the command carries no literal pin
+/// (claude's `${HCOM:-hcom}` env form, the gemini/antigravity prefix forms).
+pub(crate) fn extract_pinned_command_path(command: &str) -> Option<String> {
+    let s = command.trim();
+    // Layer 1: the gemini/antigravity `sh -c '<script>'` wrapper.
+    let inner = if s.starts_with("sh -c '") && s.ends_with('\'') && s.len() > "sh -c '".len() {
+        sh_unquote_layer(&s["sh -c '".len()..s.len() - 1])
+    } else {
+        s.to_string()
+    };
+    // Layer 2: the guard's own `cmd='<pin>';` — the pin body is the pin with
+    // apostrophes re-encoded as `'\''`; a bare `'` closes the value.
+    let rest = inner.strip_prefix("cmd='")?;
+    let chars: Vec<char> = rest.chars().collect();
+    let mut pin = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c != '\'' {
+            pin.push(c);
+            i += 1;
+            continue;
+        }
+        // `'\''` re-encodes an apostrophe; a lone `'` ends the value.
+        if i + 3 < chars.len()
+            && chars[i + 1] == '\\'
+            && chars[i + 2] == '\''
+            && chars[i + 3] == '\''
+        {
+            pin.push('\'');
+            i += 4;
+        } else {
+            return Some(pin);
+        }
+    }
+    // Ran off the end without a closing quote — not a builder-shaped value.
+    None
 }
+
+
 
 /// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).
 pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
@@ -508,25 +540,66 @@ mod tests {
     }
 
     #[test]
-    fn command_contains_pin_matches_escaped_and_spaced_pins() {
-        // Apostrophe path: the stored form carries the pin sh-escaped —
-        // once for the claude builder, twice inside gemini/antigravity's
-        // `sh -c`. The matcher must survive every layer.
+    fn extract_pinned_command_path_recovers_the_exact_pin() {
         for pin in [
             "/Users/O'Brien/tools/hcom",
             "/Users/sp ace/tools/hcom",
             "/plain/path/hcom",
+            "/tools/it's/hcom",
+            "/fleet/bin/hcom-old",
         ] {
             let script = super::pinned_hook_script(pin, "gemini-sessionstart", None, None);
-            // claude stores the script inline (single escape layer is inside
-            // the script itself); gemini/antigravity wrap it in `sh -c`.
+            // claude stores the script inline (one escape layer, inside the
+            // script itself); gemini/antigravity wrap it in `sh -c` (two).
             let wrapped = format!("sh -c {}", super::sh_single_quote(&script));
-            assert!(super::command_contains_pin(&script, pin), "inline: {script}");
-            assert!(super::command_contains_pin(&wrapped, pin), "wrapped: {wrapped}");
-            assert!(
-                !super::command_contains_pin(&wrapped, "/elsewhere/hcom"),
-                "a different pin must not match: {wrapped}"
-            );
+            assert_eq!(super::extract_pinned_command_path(&script).as_deref(), Some(pin), "inline: {script}");
+            assert_eq!(super::extract_pinned_command_path(&wrapped).as_deref(), Some(pin), "wrapped: {wrapped}");
         }
+    }
+
+    #[test]
+    fn hook_command_pin_current_is_exact_not_containment() {
+        // The reviewer's case: exe .../hcom, stored pin .../hcom-old — a
+        // containment match would call the stale pin current.
+        let stale = super::pinned_hook_script("/fleet/bin/hcom-old", "poll", None, None);
+        let current = super::pinned_hook_script("/fleet/bin/hcom", "poll", None, None);
+        assert_eq!(
+            super::extract_pinned_command_path(&stale).as_deref(),
+            Some("/fleet/bin/hcom-old")
+        );
+        assert_eq!(
+            super::extract_pinned_command_path(&current).as_deref(),
+            Some("/fleet/bin/hcom")
+        );
+
+        // it's vs its stay distinct under escaping.
+        let its = super::pinned_hook_script("/tools/its/hcom", "poll", None, None);
+        let its_sq = super::pinned_hook_script("/tools/it's/hcom", "poll", None, None);
+        assert_eq!(
+            super::extract_pinned_command_path(&its).as_deref(),
+            Some("/tools/its/hcom")
+        );
+        assert_eq!(
+            super::extract_pinned_command_path(&its_sq).as_deref(),
+            Some("/tools/it's/hcom")
+        );
+        assert_ne!(
+            super::extract_pinned_command_path(&its),
+            super::extract_pinned_command_path(&its_sq)
+        );
+
+        // Non-literal forms carry no pin.
+        assert_eq!(
+            super::extract_pinned_command_path(
+                "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
+            ),
+            None
+        );
+        assert_eq!(
+            super::extract_pinned_command_path(
+                "sh -c 'command -v hcom >/dev/null 2>&1 && exec hcom poll || exit 0'"
+            ),
+            None
+        );
     }
 }
