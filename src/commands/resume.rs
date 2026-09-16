@@ -585,6 +585,7 @@ fn prepare_resume_plan_from_source(
             run_here: launch_flags.run_here,
             batch_id: launch_flags.batch_id.clone(),
             name: launch_name,
+            claim_name: false,
             skip_validation: false,
             terminal: launch_flags.terminal.clone(),
             // Codex tracked-instance fork uses initial_prompt for an identity

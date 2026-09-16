@@ -369,7 +369,7 @@ fn restore_child_links_after_root_rebind(
 /// D3 claim liveness: computed status over stored fields and heartbeat, with
 /// an alive-pid backstop — a stale-heartbeat row whose process is still
 /// running counts live, because `stop_instance` would group-kill it.
-fn claim_target_is_live(db: &HcomDb, row: &InstanceRow) -> bool {
+pub(crate) fn claim_target_is_live(db: &HcomDb, row: &InstanceRow) -> bool {
     let computed = lifecycle::get_instance_status(row, db);
     if computed.status != ST_INACTIVE {
         return true;
@@ -383,7 +383,7 @@ fn claim_target_is_live(db: &HcomDb, row: &InstanceRow) -> bool {
     false
 }
 
-fn row_is_remote(row: &InstanceRow) -> bool {
+pub(crate) fn row_is_remote(row: &InstanceRow) -> bool {
     row.origin_device_id.as_deref().is_some_and(|v| !v.is_empty())
 }
 
@@ -453,7 +453,7 @@ fn start_rebind_opts(
 
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
     if let Some(ref meta) = target_meta {
-        ensure_rebind_compatible(&target_name, meta, ctx)?;
+        ensure_rebind_compatible(&target_name, meta, ctx.tool.as_str(), &ctx.cwd.to_string_lossy())?;
     }
 
     // Preserve last_event_id from target (cursor preservation)
@@ -828,19 +828,19 @@ fn start_rebind_opts(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RebindTargetMetadata {
-    tool: String,
-    directory: String,
-    last_event_id: i64,
-    session_id: String,
+pub(crate) struct RebindTargetMetadata {
+    pub(crate) tool: String,
+    pub(crate) directory: String,
+    pub(crate) last_event_id: i64,
+    pub(crate) session_id: String,
 }
 
-fn ensure_rebind_compatible(
+pub(crate) fn ensure_rebind_compatible(
     target_name: &str,
     meta: &RebindTargetMetadata,
-    ctx: &HcomContext,
+    current_tool: &str,
+    current_dir: &str,
 ) -> Result<()> {
-    let current_tool = ctx.tool.as_str();
     if !meta.tool.is_empty() && meta.tool != current_tool {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used tool '{}' but current session is '{}'",
@@ -849,8 +849,7 @@ fn ensure_rebind_compatible(
         );
     }
 
-    let current_dir = ctx.cwd.to_string_lossy();
-    if !meta.directory.is_empty() && !same_path(&meta.directory, &current_dir) {
+    if !meta.directory.is_empty() && !same_path(&meta.directory, current_dir) {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used directory '{}' but current session is '{}'",
             meta.directory,
@@ -861,16 +860,16 @@ fn ensure_rebind_compatible(
     Ok(())
 }
 
-fn same_path(left: &str, right: &str) -> bool {
+pub(crate) fn same_path(left: &str, right: &str) -> bool {
     normalize_path_for_compare(left) == normalize_path_for_compare(right)
 }
 
-fn normalize_path_for_compare(path: &str) -> PathBuf {
+pub(crate) fn normalize_path_for_compare(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
 /// Load rebind metadata from the live row first, then the latest stopped snapshot.
-fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMetadata> {
+pub(crate) fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMetadata> {
     if let Some(inst) = db.get_instance_full(name)? {
         return Ok(RebindTargetMetadata {
             tool: inst.tool,

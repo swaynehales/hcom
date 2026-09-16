@@ -202,6 +202,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             } else {
                 None
             },
+            claim_name: hcom_flags.instance_name.is_some(),
             skip_validation: false,
             terminal,
             append_reply_handoff: true,

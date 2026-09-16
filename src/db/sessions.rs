@@ -8,6 +8,9 @@ use crate::shared::time::now_epoch_f64;
 
 const CLAUDE_LINEAGE_VALIDATION_PREFIX: &str = "claude_lineage_validated:";
 
+pub(crate) const RESERVATION_OWNER_KEY: &str = "nrm053_reservation_owner:";
+pub(crate) const SUCCESSION_PENDING_KEY: &str = "nrm053_succession_pending:";
+
 fn claude_lineage_validation_key(session_id: &str) -> String {
     format!("{CLAUDE_LINEAGE_VALIDATION_PREFIX}{session_id}")
 }
@@ -576,7 +579,9 @@ impl HcomDb {
             return Ok(());
         }
         self.clear_session_id_from_other_instances(session_id, new_instance_name)?;
-        self.upsert_session_binding(session_id, new_instance_name)
+        self.upsert_session_binding(session_id, new_instance_name)?;
+        self.maybe_log_pending_succession(new_instance_name, session_id);
+        Ok(())
     }
 
     /// Internal helper: unconditional upsert of session binding.
@@ -631,7 +636,46 @@ impl HcomDb {
             params![session_id, instance_name],
         )?;
         self.upsert_session_binding(session_id, instance_name)?;
+        self.maybe_log_pending_succession(instance_name, session_id);
         Ok(())
+    }
+
+    /// Promote a launch-path succession record into the succession event.
+    ///
+    /// `--instance-name` claims of a dead identity write a pending record at
+    /// launch (the row itself is only pre-registered there); when the tool's
+    /// SessionStart finally binds the session, that is the moment the label
+    /// actually changed hands — logged here with the same displaced/claimer
+    /// fields the `start --as` claim writes. Best-effort: logging failure
+    /// must not fail the bind.
+    pub(crate) fn maybe_log_pending_succession(&self, instance_name: &str, session_id: &str) {
+        let key = format!("{SUCCESSION_PENDING_KEY}{instance_name}");
+        let Ok(Some(data)) = self.kv_get(&key) else {
+            return;
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+        let displaced_session_id = parsed
+            .get("displaced_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let displaced_last_event_id = parsed
+            .get("displaced_last_event_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let _ = self.log_life_event(
+            instance_name,
+            "succession",
+            "launch",
+            "reservation promoted at SessionStart",
+            Some(serde_json::json!({
+                "displaced_name": instance_name,
+                "displaced_session_id": displaced_session_id,
+                "claimer_session_id": session_id,
+                "last_event_id": displaced_last_event_id,
+            })),
+        );
+        let _ = self.kv_delete_prefix(&key);
+        let _ = self.kv_delete_prefix(&format!("{RESERVATION_OWNER_KEY}{instance_name}"));
     }
 
     /// Check if instance has a session binding (hooks active).
