@@ -718,13 +718,22 @@ fn start_rebind_opts(
     // (F4) so the handover stays observable.
     let has_predecessor = target_data.is_some() || target_meta.is_some();
     if !force_fired && !own_session && !target_remote && has_predecessor {
-        let displaced_session = if let Some(ref row) = target_data {
-            row.session_id.clone().filter(|s| !s.is_empty())
+        let (displaced_session, displaced_tool) = if let Some(ref row) = target_data {
+            (
+                row.session_id.clone().filter(|s| !s.is_empty()),
+                if row.tool.is_empty() { None } else { Some(row.tool.clone()) },
+            )
         } else {
-            target_meta
-                .as_ref()
-                .map(|m| m.session_id.clone())
-                .filter(|s| !s.is_empty())
+            (
+                target_meta
+                    .as_ref()
+                    .map(|m| m.session_id.clone())
+                    .filter(|s| !s.is_empty()),
+                target_meta
+                    .as_ref()
+                    .map(|m| m.tool.clone())
+                    .filter(|s| !s.is_empty()),
+            )
         };
         let _ = db.log_event(
             "life",
@@ -733,6 +742,8 @@ fn start_rebind_opts(
                 "action": "succession",
                 "by": "start --as",
                 "reason": "label transferred to a new session ref",
+                "from_tool": displaced_tool,
+                "to_tool": tool,
                 "displaced_name": target_name,
                 "displaced_session_id": displaced_session,
                 "claimer_session_id": session_id,
@@ -1129,7 +1140,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
-        // Ambient session-id vars are scrubbed here, once, because this is
+        // Ambient session-id vars and tool markers are scrubbed here, once, because this is
         // the choke point every claim test builds its context through. A test
         // that simulates a bare-shell claim must not depend on the shell it
         // happens to run under; the default is no session ref, and a test
@@ -1137,6 +1148,9 @@ mod tests {
         let mut env: HashMap<String, String> = std::env::vars().collect();
         for key in ["HCOM_CLAUDE_UNIX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"] {
             env.remove(key);
+        }
+        for var in crate::shared::tool_detection::tool_marker_vars() {
+            env.remove(*var);
         }
         for (k, v) in tool_env {
             env.insert((*k).to_string(), (*v).to_string());
@@ -1147,7 +1161,14 @@ mod tests {
     /// Claude context carrying exactly one session-id source, so an ambient
     /// value from the shell running the tests cannot decide the outcome.
     fn make_claude_ctx(session: Option<(&str, &str)>, cwd: &str) -> HcomContext {
-        let mut env = HashMap::new();
+        // Same ambient scrub as make_ctx, then force the Claude marker and
+        // exactly one session-id source.
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("HCOM_CLAUDE_UNIX_SESSION_ID");
+        env.remove("CLAUDE_CODE_SESSION_ID");
+        for var in crate::shared::tool_detection::tool_marker_vars() {
+            env.remove(*var);
+        }
         env.insert("CLAUDECODE".to_string(), "1".to_string());
         if let Some((key, value)) = session {
             env.insert(key.to_string(), value.to_string());
@@ -1472,6 +1493,72 @@ mod tests {
         assert!(
             ev.contains("\"claimer_session_id\":\"sess-claim\""),
             "the transfer must name the claimer session ref: {ev}"
+        );
+        assert!(
+            ev.contains("\"displaced_name\":\"nova\""),
+            "the transfer must name the label: {ev}"
+        );
+        assert!(
+            ev.contains("\"from_tool\":\"claude\""),
+            "the transfer must record predecessor tool: {ev}"
+        );
+        assert!(
+            ev.contains("\"to_tool\":\"claude\""),
+            "the transfer must record claimer tool: {ev}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_succession_event_cross_tool_reclaim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/nrm053-gap1-xtool";
+        std::fs::create_dir_all(cwd).unwrap();
+
+        // Tombstone left by claude
+        log_stopped_snapshot(&db, "nova", "claude", cwd, "sid-claude", 77);
+
+        // Reclaimed by OpenCode
+        let ctx = make_ctx(&[("OPENCODE", "1")], cwd);
+        let result = start_rebind_opts(&db, "nova", &ctx, None, ClaimOptions::default()).unwrap();
+        assert_eq!(result, 0);
+
+        let events: Vec<String> = {
+            let mut stmt = db
+                .conn()
+                .prepare(
+                    "SELECT data FROM events WHERE type = 'life' AND instance = 'nova' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let succession = events
+            .iter()
+            .filter(|d| d.contains("\"action\":\"succession\""))
+            .count();
+        assert_eq!(
+            succession, 1,
+            "the cross-tool succession must be logged as exactly one transfer event: {events:?}"
+        );
+        let ev = events
+            .iter()
+            .find(|d| d.contains("\"action\":\"succession\""))
+            .unwrap();
+        assert!(
+            ev.contains("\"from_tool\":\"claude\""),
+            "succession must record predecessor tool: {ev}"
+        );
+        assert!(
+            ev.contains("\"to_tool\":\"opencode\""),
+            "succession must record claimer tool: {ev}"
+        );
+        assert!(
+            ev.contains("\"displaced_session_id\":\"sid-claude\""),
+            "the transfer must name the predecessor session ref: {ev}"
         );
         assert!(
             ev.contains("\"displaced_name\":\"nova\""),
