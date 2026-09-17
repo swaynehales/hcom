@@ -1192,7 +1192,7 @@ fn handle_adhoc_clear_recovery(
     session_id: &str,
     transcript_path: &str,
 ) -> Option<Value> {
-    let ppid = crate::sys::process::parent_process_id();
+    let ppid = crate::sys::process::caller_process_id();
     if ppid <= 1 {
         return None;
     }
@@ -1210,7 +1210,7 @@ fn handle_adhoc_clear_recovery(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    if (now - ts).abs() > 30.0 {
+    if (now - ts).abs() > 10.0 {
         log::log_warn(
             "hooks",
             "sessionstart.adhoc_clear_expired",
@@ -2195,7 +2195,7 @@ fn handle_sessionend(
 
     if reason == "clear" {
         if ctx.process_id.is_none() {
-            let ppid = crate::sys::process::parent_process_id();
+            let ppid = crate::sys::process::caller_process_id();
             if ppid > 1 {
                 let proc_ident = crate::sys::process::identity(ppid);
                 let now = std::time::SystemTime::now()
@@ -2225,7 +2225,7 @@ fn handle_sessionend(
         );
     } else {
         if ctx.process_id.is_none() {
-            let ppid = crate::sys::process::parent_process_id();
+            let ppid = crate::sys::process::caller_process_id();
             if ppid > 1 {
                 let _ = db.kv_set(&claude_clear_adhoc_key(ppid), None);
             }
@@ -7309,6 +7309,128 @@ mod tests {
             Some("nova")
         );
         assert!(stdout.contains("nova"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_clear_adhoc_mismatched_pid_does_not_restore_name() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let hcom_dir = _dir.path().join("hcom");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_DIR".to_string(), hcom_dir.to_string_lossy().to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', '/tmp/sess-1.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        // Manually place a reservation under a different PID (e.g. 999999)
+        let payload = serde_json::json!({
+            "instance_name": "nova",
+            "session_id": "sess-1",
+            "identity": "some_ident",
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+        });
+        db.kv_set(&claude_clear_adhoc_key(999999), Some(&payload.to_string())).unwrap();
+
+        // Mark nova inactive exit:clear
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'inactive', status_context = 'exit:clear' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+
+        // SessionStart from current process (PID != 999999)
+        let raw_start = serde_json::json!({
+            "session_id": "sess-2",
+            "transcript_path": "/tmp/sess-2.jsonl",
+            "source": "clear"
+        });
+        let mut payload_start = HookPayload::from_claude(raw_start);
+        let (code, stdout, _, _) = route_claude_hook(&db, &ctx, HOOK_SESSIONSTART, &mut payload_start);
+        assert_eq!(code, 0);
+
+        // nova should remain inactive, sess-2 should NOT be bound to nova
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.status, ST_INACTIVE);
+        assert_ne!(instance.session_id.as_deref(), Some("sess-2"));
+        assert!(db.get_session_binding("sess-2").unwrap().is_none());
+        assert!(!stdout.contains("nova"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_clear_adhoc_expired_ttl_does_not_restore_name() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let hcom_dir = _dir.path().join("hcom");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_DIR".to_string(), hcom_dir.to_string_lossy().to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', '/tmp/sess-1.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        let ppid = crate::sys::process::caller_process_id();
+        let proc_ident = crate::sys::process::identity(ppid);
+        // Timestamp from 15 seconds ago (> 10s TTL)
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() - 15.0)
+            .unwrap_or(0.0);
+        let payload = serde_json::json!({
+            "instance_name": "nova",
+            "session_id": "sess-1",
+            "identity": proc_ident,
+            "timestamp": old_ts,
+        });
+        db.kv_set(&claude_clear_adhoc_key(ppid), Some(&payload.to_string())).unwrap();
+
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'inactive', status_context = 'exit:clear' WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+
+        let raw_start = serde_json::json!({
+            "session_id": "sess-2",
+            "transcript_path": "/tmp/sess-2.jsonl",
+            "source": "clear"
+        });
+        let mut payload_start = HookPayload::from_claude(raw_start);
+        let (code, stdout, _, _) = route_claude_hook(&db, &ctx, HOOK_SESSIONSTART, &mut payload_start);
+        assert_eq!(code, 0);
+
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.status, ST_INACTIVE);
+        assert_ne!(instance.session_id.as_deref(), Some("sess-2"));
+        assert!(db.get_session_binding("sess-2").unwrap().is_none());
+        assert!(!stdout.contains("nova"));
     }
 }
 

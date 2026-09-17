@@ -27,6 +27,174 @@ pub fn parent_process_id() -> u32 {
     }
 }
 
+/// (Parent PID, process name) for a given PID.
+pub fn process_info(pid: u32) -> Option<(u32, String)> {
+    process_info_platform(pid)
+}
+
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn process_info_platform(pid: u32) -> Option<(u32, String)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    let comm = unsafe {
+        std::ffi::CStr::from_ptr(info.pbi_comm.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    Some((info.pbi_ppid, comm))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn process_info_platform(pid: u32) -> Option<(u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (comm_part, rest) = stat.rsplit_once(") ")?;
+    let comm = comm_part.split_once('(')?.1.to_string();
+    let ppid = rest.split_whitespace().nth(1)?.parse::<u32>().ok()?;
+    Some((ppid, comm))
+}
+
+#[cfg(windows)]
+fn process_info_platform(pid: u32) -> Option<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut result = None;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                    let comm = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                    result = Some((entry.th32ParentProcessID, comm));
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        result
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    windows
+)))]
+fn process_info_platform(pid: u32) -> Option<(u32, String)> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid=,comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut parts = text.split_whitespace();
+    let ppid = parts.next()?.parse::<u32>().ok()?;
+    let comm = parts.next()?.to_string();
+    Some((ppid, comm))
+}
+
+fn is_shell_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let base = std::path::Path::new(&lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&lower);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    matches!(
+        base,
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "fish" | "csh" | "tcsh" | "cmd" | "powershell" | "pwsh"
+    )
+}
+
+fn is_claude_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let base = std::path::Path::new(&lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&lower);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    base == "claude" || base == "claude-code" || base == "node"
+}
+
+/// The effective caller PID for hook executions.
+///
+/// Claude Code executes hooks via an ephemeral shell (e.g. `/bin/sh -c "hcom ..."`),
+/// which can make the direct parent of `hcom` an intermediate `sh` process with
+/// a distinct PID per hook invocation.
+///
+/// This walks up the ancestor chain:
+/// 1. If any ancestor is Claude (`node`, `claude`, `claude-code`), return its PID.
+/// 2. If direct parent is an intermediate shell whose parent is not a shell
+///    (e.g. test harness invoking via `sh -c`), walk to that non-shell caller.
+/// 3. Otherwise return the direct parent PID.
+pub fn caller_process_id() -> u32 {
+    let my_pid = std::process::id();
+    let Some((parent_pid, _)) = process_info(my_pid) else {
+        return parent_process_id();
+    };
+    if parent_pid <= 1 {
+        return parent_pid;
+    }
+
+    // Step 1: Walk up ancestors looking for Claude/node
+    let mut curr = parent_pid;
+    for _ in 0..6 {
+        let Some((next_ppid, comm)) = process_info(curr) else {
+            break;
+        };
+        if is_claude_name(&comm) {
+            return curr;
+        }
+        if next_ppid <= 1 {
+            break;
+        }
+        curr = next_ppid;
+    }
+
+    // Step 2: If direct parent is an intermediate shell whose parent is not a shell,
+    // walk to that caller.
+    if let Some((grandparent_pid, parent_comm)) = process_info(parent_pid) {
+        if is_shell_name(&parent_comm) && grandparent_pid > 1 {
+            if let Some((_, grandparent_comm)) = process_info(grandparent_pid) {
+                if !is_shell_name(&grandparent_comm) {
+                    return grandparent_pid;
+                }
+            }
+        }
+    }
+
+    parent_pid
+}
+
+
+
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
