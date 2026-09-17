@@ -1133,9 +1133,13 @@ pub(crate) fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<Reb
 /// Claude sets `CLAUDE_CODE_SESSION_ID` in Bash and PowerShell subprocesses,
 /// and it matches the `session_id` passed to hooks.
 fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
-    env.get("CLAUDE_CODE_SESSION_ID")
-        .filter(|value| !value.is_empty())
-        .cloned()
+    // Two sources, in order (NRM-053 must-carry; upstream's d66d995 removed
+    // the export source along with its passive binding — our claim path
+    // still needs both, and the vanilla-bind tests pin the order): our own
+    // SessionStart export first, then Claude's own Bash-env value.
+    ["HCOM_CLAUDE_UNIX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"]
+        .into_iter()
+        .find_map(|key| env.get(key).filter(|value| !value.is_empty()).cloned())
 }
 
 /// Resolve a native session id exposed to shell commands by a direct tool run.
@@ -2210,16 +2214,7 @@ mod tests {
         );
     }
 
-    #[test]
-<<<<<<< HEAD
-    fn test_resolve_claude_session_id() {
-        let env = |value: Option<&str>| -> HashMap<String, String> {
-            value
-                .map(|value| {
-                    HashMap::from([("CLAUDE_CODE_SESSION_ID".to_string(), value.to_string())])
-                })
-                .unwrap_or_default()
-=======
+        #[test]
     #[serial]
     fn test_vanilla_claude_start_immediately_binds_exported_session() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
@@ -2277,16 +2272,32 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect()
->>>>>>> 81be0d8 (fix(name-stability): gate round 2 — promotion on the claude generation bind, pty tool alias, ambient-env class, preview, flat event fields)
         };
 
         assert_eq!(
-            resolve_claude_session_id(&env(Some("claude-sess"))),
-            Some("claude-sess".to_string())
+            resolve_claude_session_id(&env(&[
+                ("HCOM_CLAUDE_UNIX_SESSION_ID", "hook-sess"),
+                ("CLAUDE_CODE_SESSION_ID", "claude-sess"),
+            ])),
+            Some("hook-sess".to_string()),
+            "our own export stays the first source"
         );
-        assert_eq!(resolve_claude_session_id(&env(Some(""))), None);
-        assert_eq!(resolve_claude_session_id(&env(None)), None);
+        assert_eq!(
+            resolve_claude_session_id(&env(&[("CLAUDE_CODE_SESSION_ID", "claude-sess")])),
+            Some("claude-sess".to_string()),
+            "Claude's own Bash env carries identity when the env file cannot"
+        );
+        assert_eq!(
+            resolve_claude_session_id(&env(&[
+                ("HCOM_CLAUDE_UNIX_SESSION_ID", ""),
+                ("CLAUDE_CODE_SESSION_ID", "claude-sess"),
+            ])),
+            Some("claude-sess".to_string()),
+            "an empty export is not identity"
+        );
+        assert_eq!(resolve_claude_session_id(&env(&[])), None);
     }
+
 
     #[test]
     fn codex_native_identity_prefers_session_and_supports_older_builds() {

@@ -1815,7 +1815,7 @@ mod tests {
             session_id: None,
         };
 
-        let delivered =
+        let (_event_id, delivered) =
             send_message(&db, &sender, "ping", None, Some(&["paused".to_string()])).unwrap();
 
         assert_eq!(delivered, vec!["paused".to_string()]);
@@ -2643,8 +2643,10 @@ mod tests {
             ..Default::default()
         };
 
-        let err = send_message(&db, &sender, "ack", Some(&ack_to_inform), None).unwrap_err();
-        assert!(err.contains("Cannot ack an inform"));
+        // NRM-066: an ack is a read receipt on any message — acking an inform
+        // succeeds; only ack-on-ack is refused (the loop-prevention test below).
+        let (_event_id, _delivered) =
+            send_message(&db, &sender, "ack", Some(&ack_to_inform), None).unwrap();
 
         // 2. Remote ack: local id = 120, origin id = 20 (distinct IDs)
         insert_imported_remote_message(
