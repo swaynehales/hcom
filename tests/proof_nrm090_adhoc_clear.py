@@ -64,8 +64,12 @@ def main():
     try:
         out_start = subprocess.check_output([hcom_bin, "start"], env=env_a, stderr=subprocess.STDOUT).decode()
     except subprocess.CalledProcessError as e:
-        print(f"hcom start failed with code {e.returncode}:\n{e.output.decode()}")
-        sys.exit(1)
+        if "Installing claude hooks" in e.output.decode():
+            out_start = subprocess.check_output([hcom_bin, "start"], env=env_a, stderr=subprocess.STDOUT).decode()
+        else:
+            print(f"hcom start failed with code {e.returncode}:\n{e.output.decode()}")
+            sys.exit(1)
+
 
     match = re.search(r"\[hcom:([a-z]{4})\]", out_start)
     if not match:
