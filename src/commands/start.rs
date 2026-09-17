@@ -1133,13 +1133,9 @@ pub(crate) fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<Reb
 /// Claude sets `CLAUDE_CODE_SESSION_ID` in Bash and PowerShell subprocesses,
 /// and it matches the `session_id` passed to hooks.
 fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
-    // Two sources, in order (NRM-053 must-carry; upstream's d66d995 removed
-    // the export source along with its passive binding — our claim path
-    // still needs both, and the vanilla-bind tests pin the order): our own
-    // SessionStart export first, then Claude's own Bash-env value.
-    ["HCOM_CLAUDE_UNIX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"]
-        .into_iter()
-        .find_map(|key| env.get(key).filter(|value| !value.is_empty()).cloned())
+    env.get("CLAUDE_CODE_SESSION_ID")
+        .filter(|value| !value.is_empty())
+        .cloned()
 }
 
 /// Resolve a native session id exposed to shell commands by a direct tool run.
@@ -1337,9 +1333,7 @@ mod tests {
         // happens to run under; the default is no session ref, and a test
         // that wants one passes it explicitly through tool_env.
         let mut env: HashMap<String, String> = std::env::vars().collect();
-        for key in ["HCOM_CLAUDE_UNIX_SESSION_ID", "CLAUDE_CODE_SESSION_ID"] {
-            env.remove(key);
-        }
+        env.remove("CLAUDE_CODE_SESSION_ID");
         for var in crate::shared::tool_detection::tool_marker_vars() {
             env.remove(*var);
         }
@@ -1355,7 +1349,6 @@ mod tests {
         // Same ambient scrub as make_ctx, then force the Claude marker and
         // exactly one session-id source.
         let mut env: HashMap<String, String> = std::env::vars().collect();
-        env.remove("HCOM_CLAUDE_UNIX_SESSION_ID");
         env.remove("CLAUDE_CODE_SESSION_ID");
         for var in crate::shared::tool_detection::tool_marker_vars() {
             env.remove(*var);
@@ -2224,7 +2217,7 @@ mod tests {
         let ctx = make_ctx(
             &[
                 ("CLAUDECODE", "1"),
-                ("HCOM_CLAUDE_UNIX_SESSION_ID", "sess-vanilla"),
+                ("CLAUDE_CODE_SESSION_ID", "sess-vanilla"),
             ],
             "/tmp/project",
         );
@@ -2266,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_claude_session_id_sources() {
+    fn test_resolve_claude_session_id() {
         let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
             pairs
                 .iter()
@@ -2275,25 +2268,14 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_claude_session_id(&env(&[
-                ("HCOM_CLAUDE_UNIX_SESSION_ID", "hook-sess"),
-                ("CLAUDE_CODE_SESSION_ID", "claude-sess"),
-            ])),
-            Some("hook-sess".to_string()),
-            "our own export stays the first source"
-        );
-        assert_eq!(
             resolve_claude_session_id(&env(&[("CLAUDE_CODE_SESSION_ID", "claude-sess")])),
             Some("claude-sess".to_string()),
-            "Claude's own Bash env carries identity when the env file cannot"
+            "Claude's own Bash env carries identity"
         );
         assert_eq!(
-            resolve_claude_session_id(&env(&[
-                ("HCOM_CLAUDE_UNIX_SESSION_ID", ""),
-                ("CLAUDE_CODE_SESSION_ID", "claude-sess"),
-            ])),
-            Some("claude-sess".to_string()),
-            "an empty export is not identity"
+            resolve_claude_session_id(&env(&[("CLAUDE_CODE_SESSION_ID", "")])),
+            None,
+            "an empty session id is not identity"
         );
         assert_eq!(resolve_claude_session_id(&env(&[])), None);
     }
