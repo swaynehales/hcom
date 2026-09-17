@@ -61,7 +61,12 @@ def main():
 
     pid_a = os.getpid()
     print(f"\n--- STEP 1: Caller A (PID {pid_a}) starts adhoc session ---")
-    out_start = subprocess.check_output([hcom_bin, "start"], env=env_a).decode()
+    try:
+        out_start = subprocess.check_output([hcom_bin, "start"], env=env_a, stderr=subprocess.STDOUT).decode()
+    except subprocess.CalledProcessError as e:
+        print(f"hcom start failed with code {e.returncode}:\n{e.output.decode()}")
+        sys.exit(1)
+
     match = re.search(r"\[hcom:([a-z]{4})\]", out_start)
     if not match:
         print(f"Failed to parse allocated name from start output:\n{out_start}")
