@@ -8,7 +8,8 @@ Case 1 (Forwarded message):
   - lead receives delivery via hook
   - lead forwards task by sending message to review
   - lead transitions to listening (idle) via hcom listen
-  - Notice names the cause: (sent #... to @review (forwarded?))
+  - Notice names the cause: (sent #... to review (forwarded?))
+  - Notice delivered_to is strictly [flex]
 
 Case 2 (Delivered via listen, never shown in a turn):
   - lead sends request to fora
@@ -16,12 +17,14 @@ Case 2 (Delivered via listen, never shown in a turn):
   - fora has listening status but never an active turn
   - fora stops via hcom stop
   - Notice names the cause: (delivered via listen but never shown in a turn)
+  - Notice delivered_to is strictly [lead]
 
 Case 3 (No activity):
   - lead sends request to worker
-  - worker receives delivery via hook
+  - worker receives delivery via real hook (hcom pi-read --name worker --ack)
   - worker transitions to listening without any messages or turns
   - Notice names the cause: (no activity)
+  - Notice delivered_to is strictly [lead]
 """
 
 import json
@@ -117,12 +120,16 @@ def main():
     print("4. lead transitioned to listening (went idle)")
 
     # Step 5: Inspect generated notification for flex
-    notice1 = conn.execute(
-        "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to[0]') = 'flex' ORDER BY id DESC LIMIT 1"
-    ).fetchone()[0]
+    row1 = conn.execute(
+        "SELECT json_extract(data, '$.text'), json_extract(data, '$.delivered_to') FROM events WHERE type = 'message' AND json_extract(data, '$.from') = '[hcom-events]' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    notice1, delivered_to1_raw = row1[0], row1[1]
+    delivered_to1 = json.loads(delivered_to1_raw)
     print(f"\nVerbatim Notice Case 1:\n{notice1}")
-    assert f"(sent #{fwd_id} to @review (forwarded?))" in notice1, f"Notice does not name forwarded cause: {notice1}"
-    print("-> PASS: Notice names forwarded message and target correctly!")
+    print(f"Delivered To: {delivered_to1}")
+    assert f"(sent #{fwd_id} to review (forwarded?))" in notice1, f"Notice does not name forwarded cause: {notice1}"
+    assert delivered_to1 == ["flex"], f"Notice leaked to non-requester: {delivered_to1}"
+    print("-> PASS: Notice names forwarded message/target correctly and delivers solely to requester!")
 
     print("\n" + "=" * 70)
     print("CASE 2: Request delivered to keepalive listener via listen, but never shown in a turn")
@@ -151,18 +158,22 @@ def main():
     print("3. fora stopped")
 
     # Step 4: Inspect generated notification for lead
-    notice2 = conn.execute(
-        "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to[0]') = 'lead' AND json_extract(data, '$.from') = '[hcom-events]' ORDER BY id DESC LIMIT 1"
-    ).fetchone()[0]
+    row2 = conn.execute(
+        "SELECT json_extract(data, '$.text'), json_extract(data, '$.delivered_to') FROM events WHERE type = 'message' AND json_extract(data, '$.from') = '[hcom-events]' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    notice2, delivered_to2_raw = row2[0], row2[1]
+    delivered_to2 = json.loads(delivered_to2_raw)
     print(f"\nVerbatim Notice Case 2:\n{notice2}")
+    print(f"Delivered To: {delivered_to2}")
     assert "(delivered via listen but never shown in a turn)" in notice2, f"Notice does not name listen-unprompted cause: {notice2}"
-    print("-> PASS: Notice names unprompted listen cause correctly!")
+    assert delivered_to2 == ["lead"], f"Notice delivered_to unexpected: {delivered_to2}"
+    print("-> PASS: Notice names unprompted listen cause correctly and delivers solely to requester!")
 
     print("\n" + "=" * 70)
-    print("CASE 3: Recipient goes idle with no other activity")
+    print("CASE 3: Recipient goes idle with no other activity (real hook delivery)")
     print("=" * 70)
 
-    conn.execute("INSERT OR REPLACE INTO instances (name, tool, last_event_id, created_at, status) VALUES ('worker', 'claude', 0, 1000.0, 'listening')")
+    conn.execute("INSERT OR REPLACE INTO instances (name, tool, last_event_id, created_at, status) VALUES ('worker', 'pi', 0, 1000.0, 'listening')")
     conn.commit()
 
     # Step 1: lead sends request to worker
@@ -175,24 +186,29 @@ def main():
     print(f"1. lead sent request to worker: {out}")
     req3_id = conn.execute("SELECT id FROM events WHERE type = 'message' AND json_extract(data, '$.from') = 'lead' AND json_extract(data, '$.delivered_to[0]') = 'worker' ORDER BY id DESC LIMIT 1").fetchone()[0]
 
-    # Step 2: delivered via hook
-    conn.execute(
-        "INSERT INTO events (type, instance, timestamp, data) VALUES ('delivery', 'worker', datetime('now'), ?)",
-        (json.dumps({"via": "hook", "from_id": 0, "to_id": req3_id, "message_ids": [req3_id], "count": 1}),)
-    )
-    conn.commit()
-    print(f"2. delivery record recorded for worker (request #{req3_id}, via hook)")
+    # Step 2: delivered via real hook (hcom pi-read --name worker --ack)
+    hook_out = subprocess.check_output([hcom_bin, "pi-read", "--name", "worker", "--ack"], env=env).decode().strip()
+    print(f"2. worker delivered via real hook 'hcom pi-read --name worker --ack': {hook_out}")
+
+    # Verify delivery event exists and recorded via hook/pi
+    del_row = conn.execute("SELECT instance, json_extract(data, '$.via') FROM events WHERE type = 'delivery' AND instance = 'worker' ORDER BY id DESC LIMIT 1").fetchone()
+    print(f"   Recorded delivery event: instance={del_row[0]}, via={del_row[1]}")
+    assert del_row is not None, "delivery event must exist from real hook"
 
     # Step 3: worker goes idle without sending any messages
     subprocess.check_output([hcom_bin, "listen", "--name", "worker", "0"], env=env)
     print("3. worker went idle (listening)")
 
-    notice3 = conn.execute(
-        "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message' AND json_extract(data, '$.delivered_to[0]') = 'lead' AND json_extract(data, '$.from') = '[hcom-events]' ORDER BY id DESC LIMIT 1"
-    ).fetchone()[0]
+    row3 = conn.execute(
+        "SELECT json_extract(data, '$.text'), json_extract(data, '$.delivered_to') FROM events WHERE type = 'message' AND json_extract(data, '$.from') = '[hcom-events]' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    notice3, delivered_to3_raw = row3[0], row3[1]
+    delivered_to3 = json.loads(delivered_to3_raw)
     print(f"\nVerbatim Notice Case 3:\n{notice3}")
+    print(f"Delivered To: {delivered_to3}")
     assert "(no activity)" in notice3, f"Notice does not name no activity: {notice3}"
-    print("-> PASS: Notice names (no activity) correctly!")
+    assert delivered_to3 == ["lead"], f"Notice delivered_to unexpected: {delivered_to3}"
+    print("-> PASS: Notice names (no activity) correctly and delivers solely to requester!")
 
     conn.close()
     print("\n" + "=" * 70)

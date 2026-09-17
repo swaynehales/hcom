@@ -1097,7 +1097,7 @@ fn reqwatch_cause_since_delivery(
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str())
-                            .map(|s| format!("@{s}"))
+                            .map(|s| s.to_string())
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1746,6 +1746,19 @@ mod tests {
             .ok()
     }
 
+    fn last_notice_delivered_to(db: &HcomDb, pattern: &str) -> Option<Vec<String>> {
+        let raw: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.delivered_to') FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') LIKE ?1 ORDER BY id DESC LIMIT 1",
+                params![pattern],
+                |r| r.get(0),
+            )
+            .ok()?;
+        raw.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
     /// (a) A spooled edge arms the 240 s spool grace and stores its kind and
     /// start anchor.
     #[test]
@@ -1991,8 +2004,15 @@ mod tests {
         let text = last_notice_text(&db, "%without responding to your request%")
             .expect("must notify on idle");
         assert!(
-            text.contains(&format!("(sent #{fwd_id} to @kane (forwarded?))")),
+            text.contains(&format!("(sent #{fwd_id} to kane (forwarded?))")),
             "expected forwarded cause in notice, got: {text}"
+        );
+        let delivered_to = last_notice_delivered_to(&db, "%without responding to your request%")
+            .expect("notice must have delivered_to");
+        assert_eq!(
+            delivered_to,
+            vec!["gora".to_string()],
+            "notice must only be delivered to requester, not mentioned third parties"
         );
         cleanup_test_db(db_path);
     }
@@ -2039,6 +2059,13 @@ mod tests {
             text.contains("(delivered via listen but never shown in a turn)"),
             "expected unprompted listen cause in notice, got: {text}"
         );
+        let delivered_to = last_notice_delivered_to(&db, "%without responding to your request%")
+            .expect("notice must have delivered_to");
+        assert_eq!(
+            delivered_to,
+            vec!["gora".to_string()],
+            "notice must only be delivered to requester"
+        );
         cleanup_test_db(db_path);
     }
 
@@ -2057,6 +2084,13 @@ mod tests {
         assert!(
             text.contains("(no activity)"),
             "expected no activity cause in notice, got: {text}"
+        );
+        let delivered_to = last_notice_delivered_to(&db, "%without responding to your request%")
+            .expect("notice must have delivered_to");
+        assert_eq!(
+            delivered_to,
+            vec!["gora".to_string()],
+            "notice must only be delivered to requester"
         );
         cleanup_test_db(db_path);
     }
