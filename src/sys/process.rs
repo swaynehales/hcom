@@ -13,6 +13,21 @@ pub fn identity(pid: u32) -> Option<String> {
     process_identity_platform(pid)
 }
 
+/// The parent PID of the current process.
+pub fn parent_process_id() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() as u32 }
+    }
+    #[cfg(windows)]
+    {
+        snapshot_parents()
+            .and_then(|parents| parents.get(&std::process::id()).copied())
+            .unwrap_or(0)
+    }
+}
+
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

@@ -471,7 +471,7 @@ fn route_claude_hook(
         if hook_type == HOOK_SESSIONEND {
             let handler_start = Instant::now();
             let (code, stdout) =
-                handle_sessionend(db, instance_name, &session_id, &payload.raw, &updates);
+                handle_sessionend(db, ctx, instance_name, &session_id, &payload.raw, &updates);
             timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
             return (code, stdout, None, timing);
         }
@@ -538,7 +538,7 @@ fn route_claude_hook(
         }
         HOOK_SESSIONEND => {
             let (code, stdout) =
-                handle_sessionend(db, instance_name, &session_id, &payload.raw, &updates);
+                handle_sessionend(db, ctx, instance_name, &session_id, &payload.raw, &updates);
             (code, stdout, None)
         }
         _ => (0, String::new(), None),
@@ -894,6 +894,15 @@ fn handle_sessionstart(
         return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
+    // Adhoc clear recovery: rebind instance across /clear when process_id is None.
+    if source == "clear"
+        && process_id.is_none()
+        && !session_id.is_empty()
+        && let Some(output) = handle_adhoc_clear_recovery(db, ctx, session_id, transcript_path)
+    {
+        return (0, serde_json::to_string(&output).unwrap_or_default());
+    }
+
     // Vanilla instance - show hint.
     if process_id.is_none() || session_id.is_empty() {
         let hcom_cmd = crate::runtime_env::build_hcom_command();
@@ -1170,6 +1179,113 @@ fn handle_compact_recovery(
             "additionalContext": bootstrap,
         }
     }))
+}
+
+fn claude_clear_adhoc_key(pid: u32) -> String {
+    format!("claude_clear_adhoc:{pid}")
+}
+
+/// Handle adhoc clear recovery (source=clear when process_id is None).
+fn handle_adhoc_clear_recovery(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    session_id: &str,
+    transcript_path: &str,
+) -> Option<Value> {
+    let ppid = crate::sys::process::parent_process_id();
+    if ppid <= 1 {
+        return None;
+    }
+    let key = claude_clear_adhoc_key(ppid);
+    let raw = db.kv_get(&key).ok().flatten()?;
+    let _ = db.kv_set(&key, None);
+
+    let val: Value = serde_json::from_str(&raw).ok()?;
+    let owner = val.get("instance_name").and_then(|v| v.as_str())?;
+    let saved_session_id = val.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let expected_ident = val.get("identity").and_then(|v| v.as_str());
+    let ts = val.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if (now - ts).abs() > 30.0 {
+        log::log_warn(
+            "hooks",
+            "sessionstart.adhoc_clear_expired",
+            &format!("ppid={} instance={} age={:.1}s", ppid, owner, now - ts),
+        );
+        return None;
+    }
+
+    if let Some(expected_ident) = expected_ident {
+        if !crate::sys::process::has_identity(ppid, expected_ident) {
+            log::log_warn(
+                "hooks",
+                "sessionstart.adhoc_clear_identity_mismatch",
+                &format!(
+                    "ppid={} instance={} expected_ident={}",
+                    ppid, owner, expected_ident
+                ),
+            );
+            return None;
+        }
+    }
+
+    let instance = db.get_instance_full(owner).ok().flatten()?;
+    if instance.status != ST_INACTIVE || instance.status_context != "exit:clear" {
+        log::log_warn(
+            "hooks",
+            "sessionstart.adhoc_clear_invalid_status",
+            &format!(
+                "ppid={} instance={} status={} status_context={}",
+                ppid, owner, instance.status, instance.status_context
+            ),
+        );
+        return None;
+    }
+
+    match db.attach_claude_generation(owner, session_id, transcript_path, "", None) {
+        Ok(_) => {
+            lifecycle::set_status(db, owner, ST_LISTENING, "start", Default::default());
+            log::log_info(
+                "hooks",
+                "sessionstart.adhoc_clear_recovered",
+                &format!(
+                    "ppid={} instance={} old_session={} new_session={}",
+                    ppid, owner, saved_session_id, session_id
+                ),
+            );
+            let instance = db.get_instance_full(owner).ok().flatten()?;
+            let bootstrap_text = bootstrap::get_bootstrap(
+                db,
+                &ctx.hcom_dir,
+                owner,
+                "claude",
+                ctx.is_background,
+                ctx.is_launched,
+                &ctx.notes,
+                instance.tag.as_deref().unwrap_or(""),
+                false,
+                ctx.background_name.as_deref(),
+            );
+            Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": bootstrap_text,
+                }
+            }))
+        }
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "sessionstart.adhoc_clear_attach_failed",
+                &format!("ppid={} instance={} session_id={} err={}", ppid, owner, session_id, e),
+            );
+            None
+        }
+    }
 }
 
 /// Bind session to process and inject bootstrap for hcom-launched instances.
@@ -2046,6 +2162,7 @@ fn handle_notify(
 /// Parent SessionEnd: finalize session and stop instance.
 fn handle_sessionend(
     db: &HcomDb,
+    ctx: &HcomContext,
     instance_name: &str,
     session_id: &str,
     raw: &Value,
@@ -2077,6 +2194,23 @@ fn handle_sessionend(
     }
 
     if reason == "clear" {
+        if ctx.process_id.is_none() {
+            let ppid = crate::sys::process::parent_process_id();
+            if ppid > 1 {
+                let proc_ident = crate::sys::process::identity(ppid);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let payload = serde_json::json!({
+                    "instance_name": instance_name,
+                    "session_id": session_id,
+                    "identity": proc_ident,
+                    "timestamp": now,
+                });
+                let _ = db.kv_set(&claude_clear_adhoc_key(ppid), Some(&payload.to_string()));
+            }
+        }
         common::soft_finalize_session_gated(
             db,
             instance_name,
@@ -2090,6 +2224,12 @@ fn handle_sessionend(
             Some(session_id),
         );
     } else {
+        if ctx.process_id.is_none() {
+            let ppid = crate::sys::process::parent_process_id();
+            if ppid > 1 {
+                let _ = db.kv_set(&claude_clear_adhoc_key(ppid), None);
+            }
+        }
         common::finalize_session_gated(
             db,
             instance_name,
@@ -7044,7 +7184,8 @@ mod tests {
             )
             .unwrap();
 
-        let (code, _) = handle_sessionend(&db, "luna", "sess-other", &serde_json::json!({"reason": "user_quit"}), &serde_json::Map::new());
+        let ctx = make_ctx();
+        let (code, _) = handle_sessionend(&db, &ctx, "luna", "sess-other", &serde_json::json!({"reason": "user_quit"}), &serde_json::Map::new());
         assert_eq!(code, 0);
         let row = db.get_instance_full("luna").unwrap().unwrap();
         assert_eq!(
@@ -7052,7 +7193,7 @@ mod tests {
             "a foreign session's SessionEnd must not mark the row inactive"
         );
 
-        let (code, _) = handle_sessionend(&db, "luna", "sess-1", &serde_json::json!({"reason": "user_quit"}), &serde_json::Map::new());
+        let (code, _) = handle_sessionend(&db, &ctx, "luna", "sess-1", &serde_json::json!({"reason": "user_quit"}), &serde_json::Map::new());
         assert_eq!(code, 0);
         assert!(
             db.get_instance_full("luna").unwrap().is_none(),
@@ -7113,6 +7254,61 @@ mod tests {
             db.get_session_binding("sess-2").unwrap().as_deref(),
             Some("nova")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_clear_preserves_adhoc_instance_name() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let hcom_dir = _dir.path().join("hcom");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_DIR".to_string(), hcom_dir.to_string_lossy().to_string());
+        // No HCOM_PROCESS_ID, no HCOM_LAUNCHED -> adhoc session
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', '/tmp/sess-1.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        // 1. SessionEnd with reason = clear
+        let raw_end = serde_json::json!({
+            "session_id": "sess-1",
+            "transcript_path": "/tmp/sess-1.jsonl",
+            "reason": "clear"
+        });
+        let mut payload_end = HookPayload::from_claude(raw_end);
+        let (code, _, _, _) = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload_end);
+        assert_eq!(code, 0);
+
+        // 2. SessionStart with new session id on the same process
+        let raw_start = serde_json::json!({
+            "session_id": "sess-2",
+            "transcript_path": "/tmp/sess-2.jsonl",
+            "source": "clear"
+        });
+        let mut payload_start = HookPayload::from_claude(raw_start);
+        let (code, stdout, _, _) = route_claude_hook(&db, &ctx, HOOK_SESSIONSTART, &mut payload_start);
+        assert_eq!(code, 0);
+
+        // 3. The instance must still be nova, bound to sess-2, and listening
+        let instance = db.get_instance_full("nova").unwrap().expect("nova should still exist after clear");
+        assert_eq!(instance.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(
+            db.get_session_binding("sess-2").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert!(stdout.contains("nova"));
     }
 }
 
