@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
 use super::HcomDb;
@@ -1059,6 +1059,89 @@ fn collision_self_relevance_sql(caller: &str) -> String {
     )
 }
 
+fn reqwatch_cause_since_delivery(
+    db: &HcomDb,
+    target: &str,
+    request_id: i64,
+    event_id: i64,
+) -> String {
+    let delivery = db.delivery_record_for(target, request_id);
+    let (del_event_id, _ts, via) = match delivery {
+        Some(rec) => rec,
+        None => return "no activity".to_string(),
+    };
+    let after_id = del_event_id.max(request_id);
+    let up_to_id = if event_id > 0 { event_id } else { i64::MAX };
+
+    // 1. Did target send a message to someone else since delivery?
+    if let Ok(mut stmt) = db.conn().prepare_cached(
+        "SELECT id, data FROM events
+         WHERE type = 'message'
+           AND (instance = ?1 OR json_extract(data, '$.from') = ?1)
+           AND COALESCE(json_extract(data, '$.sender_kind'), '') != 'system'
+           AND id > ?2
+           AND id <= ?3
+         ORDER BY id DESC LIMIT 1",
+    ) {
+        if let Ok(Some((msg_id, data_str))) = stmt
+            .query_row(params![target, after_id, up_to_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+        {
+            if let Ok(msg_data) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                let recipients: Vec<String> = msg_data
+                    .get("delivered_to")
+                    .and_then(|v| v.as_array())
+                    .or_else(|| msg_data.get("mentions").and_then(|v| v.as_array()))
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| format!("@{s}"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !recipients.is_empty() {
+                    return format!("sent #{msg_id} to {} (forwarded?)", recipients.join(", "));
+                } else {
+                    return format!("sent #{msg_id} (forwarded?)");
+                }
+            }
+        }
+    }
+
+    // 2. Was it delivered to a keepalive listener via listen, but never shown in a turn?
+    if via == "listen" {
+        let has_active_turn = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE type = 'status'
+                   AND instance = ?1
+                   AND id > ?2
+                   AND id <= ?3
+                   AND (
+                       json_extract(data, '$.status') = 'active'
+                       OR json_extract(data, '$.new_status') = 'active'
+                   )
+                 LIMIT 1",
+                params![target, after_id, up_to_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+
+        if !has_active_turn {
+            return "delivered via listen but never shown in a turn".to_string();
+        }
+    }
+
+    // 3. Otherwise no relevant action
+    "no activity".to_string()
+}
+
 fn format_sub_notification(
     db: &HcomDb,
     sub_id: &str,
@@ -1081,15 +1164,14 @@ fn format_sub_notification(
             } else {
                 "stopped"
             };
-            let delivered = f
+            let cause = f
                 .get("request_id")
                 .and_then(|v| v.as_i64())
-                .and_then(|rid| db.delivery_record_for(target, rid))
-                .map(|(_, ts, via)| format!(" (delivered {} via {via})", &ts[..ts.len().min(19)]))
-                .unwrap_or_default();
+                .map(|rid| reqwatch_cause_since_delivery(db, target, rid, event_id))
+                .unwrap_or_else(|| "no activity".to_string());
             return format!(
-                "[sub:{}] #{} {} {} without responding to your request #{}{}",
-                sub_id, event_id, target, action, request_id, delivered
+                "[sub:{}] #{} {} {} without responding to your request #{} ({})",
+                sub_id, event_id, target, action, request_id, cause
             );
         }
 
@@ -1453,8 +1535,8 @@ mod tests {
             )
             .unwrap();
         assert!(
-            text.contains("(delivered ") && text.contains("via hook)"),
-            "notice names the delivery it is about: {text}"
+            text.contains("(no activity)"),
+            "notice names the cause: {text}"
         );
         cleanup_test_db(db_path);
     }
@@ -1872,6 +1954,113 @@ mod tests {
         );
         cleanup_test_db(db_path);
     }
+
+    // ---- NRM-091: reqwatch notice names recipient's last relevant action ----
+
+    #[test]
+    fn test_reqwatch_notice_forwarded_message_shows_cause() {
+        let (db, db_path) = setup_full_test_db();
+        let _request_id = setup_reqwatch_pair(&db, "gora", "vito", "claude");
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, last_event_id, created_at) VALUES ('kane', 'claude', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_event("status", "vito", &serde_json::json!({"status": "active"}))
+            .unwrap();
+        let fwd_id = db
+            .log_event(
+                "message",
+                "vito",
+                &serde_json::json!({
+                    "from": "vito",
+                    "delivered_to": ["kane"],
+                    "mentions": ["kane"],
+                    "scope": "mentions",
+                    "text": "can you review this?"
+                }),
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        let text = last_notice_text(&db, "%without responding to your request%")
+            .expect("must notify on idle");
+        assert!(
+            text.contains(&format!("(sent #{fwd_id} to @kane (forwarded?))")),
+            "expected forwarded cause in notice, got: {text}"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_reqwatch_notice_listen_without_turn_shows_cause() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, last_event_id, created_at)
+                 VALUES ('gora', 'claude', 0, 1000.0), ('vito', 'droid', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let req_data = serde_json::json!({
+            "from": "gora",
+            "sender_kind": "instance",
+            "scope": "mentions",
+            "text": "ping",
+            "delivered_to": ["vito"],
+            "intent": "request",
+            "mentions": ["vito"],
+        });
+        let request_id = db.log_event("message", "gora", &req_data).unwrap();
+        create_request_watches(&db, "gora", request_id, &["vito".to_string()]);
+        db.advance_cursor("vito", request_id, "listen");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "spooled"}),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": "filter"}),
+        )
+        .unwrap();
+        db.log_event("life", "vito", &serde_json::json!({"action": "stopped"}))
+            .unwrap();
+        let text = last_notice_text(&db, "%without responding to your request%")
+            .expect("must notify on stop");
+        assert!(
+            text.contains("(delivered via listen but never shown in a turn)"),
+            "expected unprompted listen cause in notice, got: {text}"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_reqwatch_notice_no_activity_shows_cause() {
+        let (db, db_path) = setup_full_test_db();
+        let _request_id = setup_reqwatch_pair(&db, "gora", "vito", "claude");
+        db.log_event(
+            "status",
+            "vito",
+            &serde_json::json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        let text = last_notice_text(&db, "%without responding to your request%")
+            .expect("must notify on idle");
+        assert!(
+            text.contains("(no activity)"),
+            "expected no activity cause in notice, got: {text}"
+        );
+        cleanup_test_db(db_path);
+    }
+
 
     #[test]
     fn test_pi_reqwatch_notifies_after_delivery_active_then_listening() {
