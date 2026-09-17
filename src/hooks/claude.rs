@@ -2076,17 +2076,32 @@ fn handle_sessionend(
         return (0, String::new());
     }
 
-    common::finalize_session_gated(
-        db,
-        instance_name,
-        reason,
-        if updates.is_empty() {
-            None
-        } else {
-            Some(updates)
-        },
-        Some(session_id),
-    );
+    if reason == "clear" {
+        common::soft_finalize_session_gated(
+            db,
+            instance_name,
+            reason,
+            if updates.is_empty() {
+                None
+            } else {
+                Some(updates)
+            },
+            true,
+            Some(session_id),
+        );
+    } else {
+        common::finalize_session_gated(
+            db,
+            instance_name,
+            reason,
+            if updates.is_empty() {
+                None
+            } else {
+                Some(updates)
+            },
+            Some(session_id),
+        );
+    }
 
     cleanup_sessionend_scoped_state(db, session_id);
 
@@ -7044,4 +7059,60 @@ mod tests {
             "the owning session's SessionEnd must tear the row down"
         );
     }
+
+    #[test]
+    #[serial]
+    fn test_claude_clear_preserves_instance_name() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        let hcom_dir = _dir.path().join("hcom");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-clear-test".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        env.insert("HCOM_DIR".to_string(), hcom_dir.to_string_lossy().to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, transcript_path, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', '/tmp/sess-1.jsonl', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-1", "nova").unwrap();
+        db.set_process_binding("process-clear-test", "sess-1", "nova").unwrap();
+
+        // 1. SessionEnd with reason = clear
+        let raw_end = serde_json::json!({
+            "session_id": "sess-1",
+            "transcript_path": "/tmp/sess-1.jsonl",
+            "reason": "clear"
+        });
+        let mut payload_end = HookPayload::from_claude(raw_end);
+        let (code, _, _, _) = route_claude_hook(&db, &ctx, HOOK_SESSIONEND, &mut payload_end);
+        assert_eq!(code, 0);
+
+        // 2. SessionStart with new session id on the same process
+        let raw_start = serde_json::json!({
+            "session_id": "sess-2",
+            "transcript_path": "/tmp/sess-2.jsonl",
+            "source": "clear"
+        });
+        let mut payload_start = HookPayload::from_claude(raw_start);
+        let (code, _, _, _) = route_claude_hook(&db, &ctx, HOOK_SESSIONSTART, &mut payload_start);
+        assert_eq!(code, 0);
+
+        // 3. The instance must still be nova, bound to sess-2, and listening
+        let instance = db.get_instance_full("nova").unwrap().expect("nova should still exist after clear");
+        assert_eq!(instance.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(
+            db.get_session_binding("sess-2").unwrap().as_deref(),
+            Some("nova")
+        );
+    }
 }
+
