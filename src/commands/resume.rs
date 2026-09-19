@@ -1105,7 +1105,10 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         .expect("resume tool must be validated before argument merging");
 
     match tool {
-        crate::tool::Tool::Claude | crate::tool::Tool::Gemini | crate::tool::Tool::Codex => {
+        crate::tool::Tool::Claude | crate::tool::Tool::Gemini => {
+            merge_claude_args(original, resume)
+        }
+        crate::tool::Tool::Codex => {
             let mut merged = original.to_vec();
             merged.extend_from_slice(resume);
             merged
@@ -1123,6 +1126,46 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
     }
+}
+
+/// Merge Claude/Gemini original launch args with resume args.
+///
+/// Strips session-control flags (`-r`/`--resume`, `--session-id`, `-c`/`--continue`,
+/// `--fork-session`) from the original launch args while preserving all other args
+/// (e.g. `--model`, `--dangerously-skip-permissions`, positional arguments).
+/// Appends resume args at the end.
+fn merge_claude_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut i = 0;
+
+    while i < original.len() {
+        let token = &original[i];
+        let token_str = token.as_str();
+
+        if matches!(token_str, "-r" | "--resume" | "--session-id") {
+            i += 1;
+            if i < original.len() && !original[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+
+        if matches!(token_str, "-c" | "--continue" | "--fork-session")
+            || token_str.starts_with("--resume=")
+            || token_str.starts_with("-r=")
+            || token_str.starts_with("--session-id=")
+        {
+            i += 1;
+            continue;
+        }
+
+        preserved.push(token.clone());
+        i += 1;
+    }
+
+    let mut merged = preserved;
+    merged.extend_from_slice(resume);
+    merged
 }
 
 /// Merge copilot original launch args with resume args.
@@ -2695,6 +2738,75 @@ mod tests {
         assert!(
             err.contains("Antigravity") && err.contains("fork"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_claude_strips_session_id_and_session_control_flags() {
+        let merged = merge_resume_args(
+            "claude",
+            &s(&[
+                "--model",
+                "claude-3-7-sonnet",
+                "--session-id",
+                "old-session-uuid",
+                "--dangerously-skip-permissions",
+            ]),
+            &s(&["--resume", "new-session-uuid"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--model",
+                "claude-3-7-sonnet",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "new-session-uuid"
+            ])
+        );
+
+        // Also test equals syntax and other session control flags
+        let merged2 = merge_resume_args(
+            "claude",
+            &s(&[
+                "--session-id=old-id",
+                "-r",
+                "stale-r",
+                "-c",
+                "--continue",
+                "--fork-session",
+                "--verbose",
+            ]),
+            &s(&["--resume", "new-session-uuid"]),
+        );
+        assert_eq!(
+            merged2,
+            s(&["--verbose", "--resume", "new-session-uuid"])
+        );
+
+        // Verify Gemini gets same stripping
+        let merged_gemini = merge_resume_args(
+            "gemini",
+            &s(&[
+                "--session-id",
+                "old-id",
+                "--resume",
+                "old-resume",
+                "--yolo",
+            ]),
+            &s(&["--resume", "new-id"]),
+        );
+        assert_eq!(merged_gemini, s(&["--yolo", "--resume", "new-id"]));
+
+        // Verify Codex preserves args verbatim
+        let merged_codex = merge_resume_args(
+            "codex",
+            &s(&["--session-id", "some-id", "--flag"]),
+            &s(&["extra"]),
+        );
+        assert_eq!(
+            merged_codex,
+            s(&["--session-id", "some-id", "--flag", "extra"])
         );
     }
 
